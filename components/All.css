@@ -35,12 +35,12 @@
 
 /* component HButtons */
 .HButton {
-    border: none;
+    border: solid thin black;
     padding: 10px 10px;
     background-color: inherit;
 }
 .HButton:hover {
-    background-color: #F0F0F0;
+    background-color: #e0e0e0;
 }
 
 .HButtons {
@@ -49,7 +49,7 @@
 }
 .HButtonSel {
     padding: 10px 10px;
-    border: none;
+    border: solid thin black;
     background-color: #ffff00;
     font-weight: 700;
 }

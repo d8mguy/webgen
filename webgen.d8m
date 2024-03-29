@@ -1,0 +1,1211 @@
+
+// webgen translator
+
+import go "flag"
+import go "io/fs"
+import go "os"
+import go "time"
+import go "os/exec"
+import "file"
+import "dict" melted
+import "olist" melted
+import "strings"
+load("modules/lexparse")        // Get all the symbols, not just the exported ones
+
+val textsegment = extend tuple(start, finish: integer) where {
+    // Javascript and css textsegments need to have braces removed
+    method bracetrim = \mod(bytes:list(byte)) -> textsegment {
+        var openOfs = self.start+1
+        var closeOfs = self.finish-1
+        while(bytes[openOfs] != '{') openOfs += 1
+        while(bytes[closeOfs] != '}') closeOfs -= 1
+        self.start = openOfs + 1
+        self.finish = closeOfs - 1
+        self
+    }
+}
+
+// Useful helper ftns to carry out the mechanics of transforming webgen args to JSX. Any assumptions
+// about what's in the string they get are in the comments for each ftn.
+val quotify = \imp(strg: string) {
+    if(strg[0] == '"') strg
+    else if(strg[0] == '`') {    // replace backticks with dblquotes but also add \ before " and replace any \n
+        var lb = cvt(strg[1...strg.count-1], list(byte))
+        val replFrom = ['"']
+        val replTo = [['\\', '"']]
+        lb = bytes.transformSingleMulti(lb, replFrom, replTo)
+        lb.pushf('"'); lb.pushb('"')
+        cvt(lb, string)
+    } else `"` + strg + `"`
+}
+
+// arg may not be quoted; xfm if it's a backtick string
+val dequotify = \imp(strg: string) {
+    if(strg[0] != '"' && strg[0] != '`') strg
+    else {
+        var lb = cvt(strg[1...strg.count-1], list(byte))
+        if(strg[0] == '`') {
+            val replFrom = ['"']
+            val replTo = [['\\', '"']]
+            lb = bytes.transformSingleMulti(lb, replFrom, replTo)
+        }
+        cvt(lb, string)
+    }
+}
+// braceify only adds braces, dequoting is done by caller if needed
+val braceify = \(strg: string) { "{" + strg + "}" }
+
+// Defns for components; must be in bdgenv before we import local components module. A component file can define
+// multiple components (though it usually only defines one). It can also require other imports.
+val componentArg = tuple(argname, argtype: string, optional: boolean, universal: boolean)
+val componentT = extend tuple(compnm: string, args: list(componentArg), hasChildren, builtin:boolean) where {
+    attribute cssDefs: string               // css defns, if found in the All.css file.
+    attribute minargs: integer              // note that minargs is computed without counting a children prop
+    attribute usecount: integer             // incr in page TC; putting this here means only 1 spec translation per run
+
+    method lithook = \mod(nm: string, argmts: list(componentArg), bi: boolean) {
+        compnm = nm
+        args = argmts
+        builtin = bi
+        if(bi) {
+            hasChildren = any(argmts.{argname == "children"})
+            minargs = argmts.count
+            if(hasChildren) minargs -= 1
+        }
+    }
+}
+// A componentFile defines 1 or more components and has zero or more imports
+// Dirname will be "" iff coming from a source stmt; in this case don't prepend "./" to the import stmt
+val componentFile = extend tuple(dirname, filename: string, comps:list(componentT)) where {
+    attribute imports: list(string)            // filenames of imported components, to copy if the file is imported
+    attribute modtime: time.Time
+    attribute fromSource: boolean               // source statements decl component files that are never copied
+    method lithook = \mod(dnm, fnm: string) {
+        dirname = dnm
+        filename = fnm
+        comps = []
+        imports = []
+    }
+    method toImportStmt = \imp() {
+        var compnts = strings.join(comps.{ compnm }, `, `)
+        if(comps.count > 1) compnts = "{ " + compnts + " }"
+        val prepend = dirname == "" ? "" : "./"
+        "import #{compnts} from '#{prepend}#{filename}'\n"
+    }
+}
+// This is for finding and typechecking component instantiations
+val componentsT = olist(componentT, string, \(x: componentT) { x.compnm })
+
+import "webgen/components" melted
+
+
+// We use pmzparse in many ways to code webgen, several of them are in the components module just imported.
+// Otherwise, the main webgen language grammar extends d8m with the statement types in the spec.
+// Full access to the grammar for d8m is the reason we load the pmzparse module instead of importing it.
+
+
+val wgpureProdns: list(rawProdn) = [
+    ["listx", :expr, "list ( ident )"],
+    ["listx", :expr, "list ( listx )"],
+    ["exprlist", :general, "expr exprlist*"],       // add this to the d8mProdns rules
+    ["typex", :general, "ident"],
+    ["typex", :general, "listx"],
+    ["colonpair", :general, "ident : typex"],
+    ["colonpairlist", :general, "colonpair colonpairlist*"],
+    ["colonpairlist", :general, "colonpair"],
+    ["wgdecl", :general, "ident : typex"],
+    ["wgdecl", :general, "ident : typex = strg"],
+    ["wgdecl", :general, "ident : typex = ident"],
+    ["wgdecllist", :general, "wgdecl"],
+    ["wgdecllist", :general, "wgdecl , wgdecllist*"],
+    ["identopttyp", :general, "ident"],
+    ["identopttyp", :general, "colonpair"],
+    ["identopttyplist", :general, "identopttyp"],
+    ["identopttyplist", :general, "identopttyp , identopttyplist*"],
+    ["responselit", :general, "{ identlist* }"],
+    ["objstmt", :stmt, "object ident = { colonpairlist* }"],
+    ["getpost", :general, "GET"],
+    ["getpost", :general, "POST"],
+    ["request", :general, "getpost ( )"],
+    ["request", :general, "getpost ( identopttyplist* )"],
+    ["respx", :general, "ident"],
+    ["respx", :general, "responselit"],
+    ["respx", :general, "responselit + expr"],
+    ["respx", :general, "ident + expr"],
+    ["respx", :general, "( ident , ident )"],
+    ["respx", :general, "( ident , ident + expr )"],
+    ["respx", :general, "( ident , responselit )"],
+    ["respx", :general, "( ident , responselit + expr )"],
+    ["responsex", :general, "response respx"],
+    ["responsex", :general, "response respx or respx"],
+    ["responsex", :general, "response respx or respx or respx"],
+    ["transitionstmt", :stmt, "transition ident strg => request then ident"],
+    ["transitionstmt", :stmt, "transition ident strg => request then ident responsex"],
+    ["statestmt", :stmt, "state wgdecllist*"],
+    ["psx", :stmt, "expr { stmtlist* }"],
+    ["pgstmt", :stmt, "pagespec ident = stmt"],
+    // Neither javascript nor css are parseable with these definitions since stmts doesn't include javascript or css
+    // constructs, but they are scannable since {} is a bracket pair.
+    ["jsstmt", :stmt, "javascript stmts"],
+    ["cssstmt", :stmt, "css stmts"],
+    ["htmlstmt", :stmt, "html ident = strg"],
+    ["sourcestmt", :stmt, "source strg / wgdecllist* / identlist*"],
+    ["respstmt", :stmt, "response ident responselit"],
+    ["compstmt", :stmt, "components strg"],
+    ["compstmt", :stmt, "components identlist*"]
+]
+
+val wgKeywords =
+    ["transition", "state", "pagespec", "javascript", "css", "html", "object", "source", "then", "response", "components", "GET", "POST", "list", "or"]
+
+// Here's the grammar for full webgen, extending d8m grammar
+val wgDefn = [langDefn: d8mOperators, rawprodnsD8m + wgpureProdns, [tclassLabel, tclassQuoted], wgKeywords + d8mKeywords,
+    d8mBrackets, d8mComments, d8mSeparators, true]
+
+val wgBaseTypeStrings = ["integer", "float", "string", "boolean", "label", "object", "submitter"]
+val wgBaseTypeValues = ["0", "0.0", `""`, "false", `""`, "null", "null"]
+
+var gensymCounter = 0
+
+// defns for state symbols
+val wgType = extend tuple(leaf: string, lists:integer) where {
+    method lithook = \mod(lf: string, lv: integer) { leaf = lf; lists = lv }
+    method lithook = \mod(trm: Term) {      // trm.kind should be "typex"
+        lists = 0
+        var cur = trm.child0
+        while(cur.kind == "listx") { cur = cur.child0; lists += 1 }
+        leaf = asString(cur)
+    }
+    method stringify = \imp() {
+        var base = leaf
+        each(i^1..lists) base = "list(#{base})"
+        base
+    }
+    // This is the default value string in javascript
+    method defaultValue = \() {
+        if(lists > 0) "[]" else {
+            val lfi = wgBaseTypeStrings.index(leaf)
+            if(lfi == nil) "{}"
+            else wgBaseTypeValues[lfi]
+        }
+    }
+}
+val stateSymT = extend tuple(ident: string, typ:wgType, initval: string) where {
+    method lithook = \mod(nm: string) { ident = nm; typ = [wgType: "integer", 0]; initval = "0" }
+    method lithook = \mod(trm: Term) {
+        ident = asString(trm.child0)
+        typ = [wgType: trm.child1]
+        initval = (asTerms(trm).count == 3 ? asString(trm.child2) : "")
+    }
+    // generate string for javascript const decl of self
+    method toDecl = \imp() {
+        var init0: string
+        if(initval == "") init0 = typ.defaultValue
+        else if(typ.lists == 0 && typ.leaf == "string") init0 = quotify(initval)
+        else init0 = dequotify(initval)
+        "\tconst [#{ident}, set#{strings.toCap(ident)}] = useState(#{init0})"
+    }
+    // generate string for javascript decl of set*At function
+    method toSetAt = \() {
+        val capzd = strings.toCap(ident)
+        "function set#{capzd}At(xx, inx) {\n\t\tconst tmp = #{ident}.slice();\n\t\ttmp[inx] = xx;\n\t\tset#{capzd}(tmp);\n\t}"
+    }
+    // generate string for server
+    method toGetParam = \imp() {
+        var deco = ""
+        if(typ.lists == 0) {
+            if(typ.leaf == :integer) deco = ".to_i" else if(typ.leaf == :float) deco = ".to_f"
+            "val #{ident} = r.FormValue(\"#{ident}\")" + deco
+        } else if(typ.lists == 1) {
+            val gensym = ident+stringify(gensymCounter)
+            gensymCounter += 1
+            if(typ.leaf == :integer) deco = ".{ this.to_i }" else if(typ.leaf == :float) deco = ".{ this.to_f }"
+            "val #{gensym} = r.FormValue(\"#{ident}\")\nval #{ident} = strings.split(#{gensym}, `,`)" + deco
+        } else exit("can't handle nested lists")
+    }
+}
+val stateSymsT = olist(stateSymT, string, \(x:stateSymT) { x.ident })
+
+val bdgpt = tuple(ident: string, typ: wgType)
+val objdefT = extend tuple(ident: string, attribs: list(bdgpt)) where {
+    // generate string for d8m decl of self, empty string if it uses object as a leaf type in any attribute
+    method toD8mDecl = \() {
+        val usesDynamic = attribs[typ.leaf == "object"]
+        if(usesDynamic != nil) {
+            "// #{ident} uses object, can't be declared as a d8m type\n"
+        } else {
+            val astrgs = attribs.{ ident + ": " + stringify(typ) }
+            "val #{ident} = tuple(#{strings.join(astrgs, `, `)})\n"
+        }
+    }
+}
+
+// This is a response lit and the binding of a response symbol
+val responseT = tuple(syms: list(stateSymT))
+// The response part of a transition stmt has 0 or more of these; only 1 of respsym+resplit should be active
+val responsePart = tuple(pgname, respsym: string, resplit:list(stateSymT), respcall:list(string))
+// isState tells whether actual state sym or not; if isState=false, info will be filled in but with an undeclared ident
+val requestT = tuple(isState:boolean, info: stateSymT)
+
+// TransT is internal repn of a transition stmt.
+val transT = extend tuple(ident:string, isGet:boolean, path, actionfn:string) where {
+    attribute requests:list(requestT)
+    attribute response: list(responsePart)
+}
+val transDict = dict(string, transT)
+
+// defns for pagespecs
+// PTerm is the Term variant that represents internalized pagespecs. The :terms variant will always be a component
+// instantiation, so its first arg will be a :comp; the other variants are leaf nodes. Nested component
+// instantiations are nested :terms. The ident slot holds the identifier of the component prop for the corresponding
+// position.
+val PTerm: type = extend tuple(ident: string,
+        v: ortype(terms: list(PTerm), leaf: Term, comp: componentT, comparg: componentArg)) where {
+    method stringify = \() -> string {
+        val args = case v {
+        list(PTerm) => strings.join(v.{stringify(this)}, ";")
+        Term => stringify(v)
+        componentT => v.compnm
+        componentArg => v.argname
+        }
+        "[#{ident}: #{args}]"
+    }
+    method asTerms = \() { always(x~self.v, tag(x) == :terms) }
+    method asLeaf = \() { always(x~self.v, tag(x) == :leaf) }
+    method asString = \() { asString(asLeaf(self)) }        // strings are encoded in Terms
+    method asComp = \() { always(x~self.v, tag(x) == :comp) }
+    method asComparg = \() { always(x~self.v, tag(x) == :comparg) }
+    method asError = \() { asString(self) }     // extract error string, assuming generated by makeErrorPTerm
+    method child0 = \() { asTerms(self)[0] }
+    method child1 = \() { asTerms(self)[1] }
+
+    // guaranteed by checkActual to be a "tilde" or "transition" expr
+    method toJSXArgString = \imp() {
+        if(ident == "transition") {
+            val transargs = asTerms(asLeaf(self))
+            asString(transargs[0]) + "=" + braceify(asString(transargs[1]))
+        } else if(ident == "eval") {
+            braceify(dequotify(asString(self))) + "\n"
+        } else {
+            val tildx = asTerms(self)
+            val comparg = asComparg(tildx[0])
+            var propname = comparg.argname
+            val proptype = comparg.argtype
+            val propval = asLeaf(tildx[1])
+            var strgval = asString(propval)
+            if(propname == "class") {
+                propname = "className"
+                strgval = quotify(asString(propval))
+            } else if((propname == "width" || propname == "height") && comparg.universal) {
+                // universal width and height are CSS props, otherwise, they're real props of the instantiated component
+                strgval = "{{#{propname}:#{strgval}}}"
+                propname = "style"
+            } else if(proptype == "string") {
+                if(propval.kind == "strg") {
+                    if(strgval.count > 5 && strgval[1..5] == "() =>") {
+                        strgval = braceify(strgval[6...strgval.count-1])    // strip () => and quotes
+                    }
+                } else if(propval.kind == "ident") strgval = braceify(strgval)
+            } else if(propval.kind == "ident") strgval = braceify(strgval)
+            else if(propval.kind == "strg") {
+                if(proptype != "string") strgval = braceify(dequotify(strgval))
+            } else if(propval.kind == "int" || propval.kind == "flt") strgval = braceify(quotify(strgval))
+            else println("toJSXArgStrg gets kind=", propval.kind)
+            propname + "=" + strgval
+        }
+    }
+
+    // Variant of toJSXArgString for the label case of the H* BI tags
+    method toLabelString = \() {
+        val contents = asString(asTerms(self)[1])
+        if(contents[0] == '"' || contents[0] == '`') dequotify(contents) else braceify(contents)
+    }
+}
+val makeEmptyPTerm = \(ival: string) { [PTerm: ival, [Term: "", "", 0]] }
+
+// A psinfoT starts out with just the postparse Term, then is processed to get the interned form.
+// Finally, we generate the last two slots when figuring out how pages are assigned to Insert points.
+// Note: pageinx is initzd to 0, then set to -1 if used in an Insert expr. This facilitates error checking.
+val psinfoT = tuple(postparse: Term, interned: PTerm, pageinx: integer, pageSV: string)
+val psDictT = dict(string, psinfoT)
+
+// An insertInfo describes a single instantiation of Insert, the gensym is the name we'll
+// use to create a SV for the pages, pgcountK for K=0,1,..., distinct per Insert.
+// The pgnm is the name of the page in which the insert occurs
+val insertInfo = extend tuple(gensym: string, pages: list(string), pgnm: string, cntlexpr: string) where {
+    method setup = \() {
+        if(pages.count > 1) {
+            val mapnm = gensym + "Map"
+            "const #{mapnm} = [#{strings.join(pages, ", ")}];\n"
+        } else ""
+    }
+    method call = \imp() {
+        if(pages.count == 1) "{" + pages[0] + "()}\n"
+        else {
+            var pgvalue = gensym + "Map["
+            if(cntlexpr != "") pgvalue += dequotify(cntlexpr)
+            else pgvalue += gensym
+            "{#{pgvalue}]()}\n"
+        }
+    }
+}
+
+// defns for deeply builtin symbols
+val propsBI:list(componentArg) =
+    [["class", "string", true, true], ["width", "string", true, true], ["height", "string", true, true]]
+val compsBI:list(componentT) = [
+    ["Div", [["children", "any", true, false]], true],
+    ["Span", [["children", "any", true, false]], true],
+    ["H1", [["label", "string", false, false], ["children", "any", true, false]], true],
+    ["H2", [["label", "string", false, false], ["children", "any", true, false]], true],
+    ["H3", [["label", "string", false, false], ["children", "any", true, false]], true],
+    ["H4", [["label", "string", false, false], ["children", "any", true, false]], true],
+    ["H5", [["label", "string", false, false], ["children", "any", true, false]], true],
+    ["H6", [["label", "string", false, false], ["children", "any", true, false]], true],
+    ["HListView", [["iterator", "string", false, false]], true],
+    ["VListView", [["iterator", "string", false, false]], true],
+    ["Eval", [["__jsexpr", "string", false, false]], true]
+]
+
+val byFile = tuple(filename:string, compnms:list(string))
+val byDir = tuple(dirname:string, files: list(byFile))
+
+val htmlfileT = tuple(vblnm, filepattern: string)
+
+// Here's where we keep the gbl state for the translation in progress
+val wgState = extend tuple(comps: componentsT) where {
+    attribute objdefns: list(objdefT)
+    attribute stateSyms:stateSymsT
+    attribute pages: psDictT
+    attribute pagesDefnOrder: list(string)     // need pages in defn for defaulting
+    attribute transitions: transDict
+    attribute responseSymbols: dict(string, responseT)
+    attribute css, js, d8m: list(textsegment)
+    attribute htmls: list(htmlfileT)
+    attribute error: string
+    attribute inserts: list(insertInfo)     // one per call to Insert
+    attribute indexNames: list(string)      // this is for *ListView possibly nested.
+    attribute contents: list(byte)          // have a copy of this for line number calcs
+    attribute compFiles: list(componentFile)
+    attribute forCopy: list(byDir)
+    attribute biComponentsDir: string       // This is the per-OS path to installed BI components
+
+    // given a componentsReader and directory name, check for errors and update self.comps
+    // We could directly mod self.error but better to return non-empty string for setting by caller.
+    method processComponentsRead = \mod(cRead: componentsReader, dirname:string) {
+        if(cRead.error != "") return cRead.error
+        // If any components were found, we require All.css, otherwise don't care
+        if(cRead.compFiles.count == 0) println("warning: no components found in #{dirname}")
+        each(cf^cRead.compFiles) {
+            each(compnt^cf.comps) {
+                if(self.comps.keyIn(compnt.compnm)) return "in #{dirname}/#{cf.filename}: component #{compnt.compnm} redeclared"
+                comps.insert(compnt)
+            }
+        }
+        self.compFiles += cRead.compFiles
+        ""
+    }
+
+    // Caller should check if error != "" after creating this.
+    method lithook = \mod(bytes:list(byte)) {
+        comps = [componentsT: compsBI]
+        var insertcomp = [componentT: "Insert", [], true]
+        insertcomp.minargs = 1          // here's why special handling is  required
+        comps.insert(insertcomp)
+        compFiles = []
+        forCopy = []
+        val userDir = os.Getenv("HOME")
+        if(userDir == "") exit("can't get $HOME")
+        biComponentsDir = userDir + "/Library/Application Support/D8m/Webgen/components"
+        error = processComponentsRead(readComponents(biComponentsDir), "components")
+        css = []
+        js = []
+        d8m = []
+        objdefns = []
+        contents = bytes
+    }
+
+    method makeErrorPTerm = \(errmsg: string, loc:integer) {
+        val linenum = 1 + count(contents[0...loc].[this == '\n'])
+        val locpart = " on line #{linenum}"
+        [PTerm: "ERRORTC", [Term: "strg", errmsg + locpart, 0]]
+    }
+
+    // We also occasionally need to report locations on Terms
+    private method location = \(trm:Term) {
+        val linenum = 1 + count(contents[0...trm.loc].[this == '\n'])
+        "line #{linenum}"
+    }
+
+    // Is trm an identifier that names a state variable?
+    method svIdent = \(trm: Term) { trm.kind == "ident" && self.stateSyms.keyIn(asString(trm)) }
+
+    // Get the name of the first slot of a responsePart, looking up the responseSymbol if needed
+    method firstSlot = \(rp: responsePart) {
+        if(rp.respsym != "") {
+            val rsymbdg = always(x~responseSymbols[rp.respsym], x!=nil)
+            rsymbdg.syms[0].ident
+        } else rp.resplit[0].ident
+    }
+
+    // Typecheck a pagespec and produce a PTerm suitable for asgnmt to the interned slot of a psinfoT.
+    // If an error is detected, return a PTerm whose ident is set to "ERRORTC" and errmsg in v.
+    // The expected form of the incoming pgtrm is a "psx" with 2 args: a funcall and a stmtlist. Funcalls have
+    // an expr (usually an ident) for the function and an optional exprlist for the args, omitted if no args.
+    //
+    // On the output side, the format is: leaf nodes can be labeled with std literals: ident, strg, int, flt.
+    // There are 4 pseudo leaf labels: caret, index, comp, Insert. The only non-leaf labels are "fcall" and "children".
+    // Caret and index are "pseudo-leaf" nodes, their v slot is a Term and they're used in *ListView headers and bodies,
+    // respectively. The "comp" label's v slot is a componentT; it's always the first in the arglist of a "fcall".
+    // The Insert label's v slot is a Term with the name of the gensym so it can be found in wgs.inserts.
+    // If the component instantiation has children, they are in a "children" PTerm as the last elt of the arglist.
+    // And children is a full list(PTerm).
+    // To guide codegen, I substitute in leaf nodes the argtype of the componentArg for the kind slot of the Term.
+    // This loses no info since the old value of the kind slot is in the ident slot of the new PTerm.
+    method checkPage = \mod(pgtrm: Term, pgname: string) -> PTerm {
+        var inListView: boolean     // this is set in handleFuncall and used by its caller
+        // Argdesc is from the components arg list, aarg is the Term to bind, usually a literal.
+        // Return a corresponding PTerm, which may be an error PTerm.
+        val checkActual = \imp(argdesc: componentArg, aarg: Term) {
+            val kind = aarg.kind
+            // special treatment for *ListView iterators: secret implem hack is that arg named "iterator" accepts caret
+            if(kind == "caret" && argdesc.argname == "iterator") { return [PTerm: kind, aarg] }
+            unless(kind in ["ident", "strg", "int", "flt"]) makeErrorPTerm("unexpected arg tag #{kind}", aarg.loc)
+            else if(argdesc.argname == "__jsexpr") {
+                [PTerm: "eval", aarg]
+            } else if(kind == "ident" && argdesc.argtype == "submitter") {
+                val transnm = asString(aarg)
+                val transn = transitions[transnm]
+                if(transn == nil) makeErrorPTerm("#{asString(aarg)} is not a transition", aarg.loc)
+                else [PTerm: "transition",
+                      [Term: "proppair", [[Term: "ident", argdesc.argname, aarg.loc], [Term: "ident", transnm, aarg.loc]], 0]]
+            } else if(kind == "int" && argdesc.argtype != "integer") makeErrorPTerm("integer expected", aarg.loc)
+            else if(kind == "flt" && argdesc.argtype != "float") makeErrorPTerm("float expected", aarg.loc)
+            else [PTerm: kind, [[PTerm: "ca", argdesc], [PTerm: "aarg", aarg]]]
+        }
+        val handleFuncall = \imp(fc: Term) {    // fc.kind should be "funcall"
+            val args = asTerms(fc)
+            unless(args[0].kind == "ident") return makeErrorPTerm("malformed funcall: #{args[0]}", fc.loc)
+            val ident = asString(args[0])
+            val actuals:list(Term) = (args.count == 1 ? [] : asTerms(args[1]))
+            var compnt = comps.get(ident)
+            if(compnt == nil) return makeErrorPTerm("unrecognized component: #{ident}", fc.loc)
+            compnt.usecount += 1
+            if(actuals.count < compnt.minargs)
+                return makeErrorPTerm("component: #{ident} requires at least #{compnt.minargs} arguments", fc.loc)
+            // check that the pattern of tilde vs non-tilde args is ok
+            val firstNamed = actuals[this.kind == "tilde" => index]
+            val tildeCount = actuals.[this.kind == "tilde"].count
+            if(firstNamed != nil && actuals.count - firstNamed > tildeCount)
+                return makeErrorPTerm("unlabeled arguments must be initial only", fc.loc)
+            // Insert is different enough that we must handle it as a special case
+            if(compnt.compnm == "Insert") {
+                if(tildeCount > 0) return makeErrorPTerm("Insert requires only untagged arguments", fc.loc)
+                if(actuals.count == 0) return makeErrorPTerm("Insert requires at least one page", fc.loc)
+                val iident = "pgcount#{self.inserts.count}"
+                var pgnames: list(string) = []
+                each(arg^actuals[0...actuals.count]) {
+                    val strg = asString(arg)
+                    if(pages[strg] == nil) return makeErrorPTerm("#{strg} is not a known page", fc.loc)
+                    else pages[strg].pageinx = -1
+                    pgnames.pushb(strg)
+                }
+                val iinfo = [insertInfo: iident, pgnames, pgname, ""]
+                inserts.pushb(iinfo)
+                self.stateSyms.insert([stateSymT: iident])
+                return [PTerm: "Insert", [Term: "ident", iident, 0]]
+            }
+            // before main arg check, run a hack for *ListView
+            inListView = (ident.count == 9 && ident[1...9] == "ListView")
+            if(inListView) {
+                unless(actuals[0].kind == "caret") return makeErrorPTerm("#{ident} must start with x^y arg", fc.loc)
+                self.indexNames.pushb(asString(actuals[0].child0))
+            }
+            // check the args
+            var propxs = [list(PTerm): ]
+            propxs.pushb([PTerm: "comp", compnt])
+            val counted = (firstNamed != nil ? firstNamed : actuals.count)
+            var seen: list(integer) = []
+            each(i^0...counted) {
+                seen.pushb(i)
+                val pt0 = checkActual(compnt.args[i], actuals[i])
+                if(pt0.ident == "ERRORTC") return pt0
+                propxs.pushb(pt0)
+            }
+            each(i^counted...actuals.count) {
+                val argnm = asString(actuals[i].child0)
+                var argd: componentArg
+                val inx = compnt.args[argname == argnm => index]
+                if(inx == nil) {
+                    val biinx = propsBI[argname == argnm => index]
+                    if(biinx == nil) return makeErrorPTerm("#{argnm} is not a prop of #{ident}", actuals[i].loc)
+                    argd = propsBI[biinx]
+                } else {
+                    seen.pushb(inx)
+                    argd = compnt.args[inx]
+                }
+                val pt0 = checkActual(argd, actuals[i].child1)
+                if(pt0.ident == "ERRORTC") return pt0
+                propxs.pushb(pt0)
+            }
+            each(arg^compnt.args, arginx)
+                unless(arg.optional || arginx in seen)
+                    return makeErrorPTerm("required arg #{arg.argname} missing from instantiation of #{ident}", fc.loc)
+            [PTerm: "fcall", propxs]
+        }
+        if(pgtrm.kind == "psx") {
+            var fcpt = handleFuncall(pgtrm.child0)
+            unless(fcpt.ident == "ERRORTC") {
+                // collect children, special handling for Insert
+                val childTerms = asTerms(pgtrm.child1)
+                var children: list(PTerm)
+                if(fcpt.ident == "Insert") {
+                    unless(childTerms.count == 1 && childTerms[0].kind == "strg") return makeErrorPTerm("Insert expects quoted condition", pgtrm.loc)
+                    val pgcname = asString(asLeaf(fcpt))
+                    val insinx = always(x~self.inserts[gensym == pgcname => index], x != nil)
+                    self.inserts[insinx].cntlexpr = asString(childTerms[0])
+                } else {
+                    var children: list(PTerm) = []
+                    each(child^childTerms) {
+                        val child0 = self.checkPage(child, pgname)
+                        children.pushb(child0)
+                    }
+                    val firstError = children[this.ident == "ERRORTC"]
+                    if(firstError != nil) return firstError
+                    var fcptArgs = asTerms(fcpt)
+                    fcptArgs.pushb([PTerm: "children", children])
+                }
+            }
+            if(inListView) self.indexNames.popb
+            fcpt
+        } else if(pgtrm.kind == "funcall") {
+            handleFuncall(pgtrm)
+        } else if(pgtrm.kind == "strg") {
+            [PTerm: "eval", pgtrm]      // "naked" strings are eval'd; use Text component to avoid this.
+        } else makeErrorPTerm("unexpected tag #{pgtrm.kind}", pgtrm.loc)
+    }
+}
+
+// Turn a PTerm representing a component instantiation into a string in JSX form.
+// This might make sense as a PTerm method.
+val generateJSX = \imp(ptrm: PTerm, wgs: wgState) -> string {
+    case {
+        ptrm.ident == "fcall" => {
+            var args = asTerms(ptrm)
+            assert args.count != 0
+            val kids = args.last
+            if(kids.ident == "children") args.popb
+            val compnt = asComp(args[0])
+            if(compnt.builtin && compnt.args[0].argname == "iterator") {
+                // here for *ListView, entirely handled here
+                val iterargs = asLeaf(args[1])
+                val indexident = asString(iterargs.child0)
+                val countexpr = asString(iterargs.child1)
+                var stylepart = ["display:'flex'"]
+                var classpart = ""
+                each(i^2...args.count) {
+                    // collect extra args to *ListView, which can only be style things (width, height, class)
+                    val tildx = asTerms(args[i])
+                    val comparg = asComparg(tildx[0])
+                    var propname = comparg.argname
+                    val proptype = comparg.argtype
+                    val propval = asLeaf(tildx[1])
+                    var strgval = asString(propval)
+                    if(propname == "class") classpart = "className=#{strgval} "
+                    else stylepart.pushb(propname + ":" + dequotify(strgval))
+                }
+                val divWrapper = "<div " + classpart + "style={{" + strings.join(stylepart, ", ") + "}}>\n"
+                val listlit = "{[...Array(#{countexpr}).keys()]"
+                val nested = strings.join(asTerms(kids).{ this.generateJSX(wgs) }, "\n")
+                divWrapper + listlit + ".map(#{indexident} => { return (\n" + nested + "\n)})}\n</div>\n"
+            } else if(compnt.builtin && compnt.args[0].argname == "label") {     // H1..H6
+                val lbl = args[1].toLabelString
+                val others = (args.count > 2 ? strings.join(args[2...args.count].{this.toJSXArgString}, " ") : "")
+                val lcname = strings.toLower(compnt.compnm)
+                "<#{lcname} #{others}>#{lbl}</#{lcname}>"
+            } else {
+                val argstrgs = args.tail.{ this.toJSXArgString }
+                var ending = "/>\n"
+                val compnm = (compnt.builtin ? strings.toLower(compnt.compnm) : compnt.compnm)
+                var fcallpart = "<" + compnm + " " + strings.join(argstrgs, " ")
+                if(kids.ident == "children")
+                    ending = ">\n" + strings.join(asTerms(kids).{ this.generateJSX(wgs) }, "\n") + "</#{compnm}>\n"
+                fcallpart + ending
+            }
+        }
+        ptrm.ident == "Insert" => {
+            val insertsym = asString(ptrm)
+            val iinfo = always(x~wgs.inserts[gensym == insertsym], x != nil)
+            iinfo.call
+        }
+        ptrm.ident == "transition" => {
+            exit("should not happen")
+        }
+        ptrm.ident == "eval" => {
+            braceify(dequotify(asString(ptrm))) + "\n"
+        }
+        else => {
+            exit("unexpected")
+        }
+    }
+}
+
+import "webgen/boilerplate"
+
+// Put flags here since portnum is used in following code
+var clientDir:string = flag.String("client", "src", "directory to copy client files to, relative to .")
+var portnum:integer = flag.Int("port", 8080, "port number that server listens to for transitions")
+var deploy:boolean = flag.Bool("deploy", false, "if set, create server only, and include static server for react build/ directory")
+
+// Here for the App.js codegen:
+// - fixed strings at the top
+// - generate and write imported components
+// - generate and write html files, if any
+// - state decls
+// - javascript from the spec
+// - setStateAt ftn defns
+// - defns a/w responses and transitions: decode fns, trans fns
+// - translations of page specs
+val writeAppJS = \mod(wgs: wgState, dir: string, specfile: list(byte)) {
+    val callSetState = \(ident, actual: string) { "set#{strings.toCap(ident)}(#{actual});\n" }
+    val targetfiles = file.dirEntries(dir).[strings.endsWith(this.Name(), ".js")]
+    val targetFilenames = targetfiles.{ this.Name() }
+
+    // ensure that used components with imports get counted. It's possible that I should iterate to fixpt on this but in
+    // practice, I don't think it's necessary.
+    each(cf^wgs.compFiles) {
+        if(any(cf.comps.{usecount > 0})) {
+            each(imported^cf.comps) {
+                var compnt = wgs.comps.get(imported.compnm)
+                if(compnt != nil) compnt.usecount = 1
+            }
+            //println("importing", cf.filename, "; its imports are", cf.imports, "and it defines", cf.comps.{this.compnm})
+        }
+    }
+    val fullpathApp = dir + "/App.js"
+    if(file.quickCheck(fullpathApp) >= 0) os.Rename(dir + "/App.js", dir + "/App0.js")       // save 1 level of backup
+    var fd = file.createWithError(fullpathApp)
+    if(tag(fd) == :err) { println(fd); return }
+    fd.write(boilerplate.client.imports)
+    // special handling for importing react
+    val uestrg = wgs.transitions["onLoad"] == nil ? "" : ", useEffect"
+    fd.write("import React, { useState" + uestrg + " } from 'react';\n")
+    each(cf^wgs.compFiles) {
+        if(any(cf.comps.{usecount > 0})) {
+            // and arrange to copy if file passes various filtering tests
+            var doCopy = false
+            val tgtinx = targetFilenames.index(cf.filename)
+            if(tgtinx == nil) doCopy = true
+            else {
+                val tgttime = file.modtime(targetfiles[tgtinx])
+                //print("for compnt file", cf.filename, "modtime=", cf.modtime, "and tgt modtime=", tgttime)
+                if(tgttime.Sub(cf.modtime) > 0) doCopy = true
+                //println("doCopy set to ", doCopy)
+            }
+            if(doCopy) {
+                var byDir0: byDir
+                val inx = wgs.forCopy[dirname == cf.dirname => index]
+                if(inx == nil) {
+                    byDir0 = [byDir: cf.dirname, []]
+                    wgs.forCopy.pushb(byDir0)
+                } else byDir0 = wgs.forCopy[inx]
+                byDir0.files.pushb([byFile: cf.filename, cf.comps.{ this.compnm }])
+            }
+            fd.write(cf.toImportStmt)
+        }
+    }
+    fd.write("\n\n")
+    each(htm^wgs.htmls) {
+        val ptn = htm.filepattern
+        val doGlob = '*' in cvt(ptn, list(byte))
+        var filenames = [ptn]
+        if(doGlob) {
+            val globbed = fs.Glob(os.DirFS("."), ptn)
+            if(globbed.err != nil) exit(globbed.err)
+            filenames = globbed.ok
+        }
+        var contents: list(string) = []
+        each(fn^filenames) {
+            var bytes:list(byte)
+            if(strings.endsWith(fn, ".md")) {
+                val pdout = exec.Command("pandoc", ["-r", "gfm", fn]).Output()
+                if(pdout.err != nil) exit(pdout.err)
+                bytes = pdout.out
+            } else {
+                var fd = file.openWithError(fn)
+                if(tag(fd) == :err) exit(fd)
+                bytes = zerolist(fd.size())
+                fd.read(bytes)
+            }
+            // Note: lexparse is loaded (not imported) so its inclusion of bytes module as ch interferes. (I should fix this compiler behavior)
+            if(doGlob) contents.pushb(cvt(bytes, string))
+            else contents = bytes.split(bytes, cvt("<hr />\n", list(byte))).{ cvt(this, string) }
+        }
+        fd.write("const #{htm.vblnm} = [")
+        val lastinx = contents.count -1
+        each(inx^0...contents.count) {
+            fd.write("\n`#{contents[inx]}`")
+            if(inx < lastinx) fd.write(",")
+        }
+        fd.write("]\n")
+    }
+    fd.write(boilerplate.client.setup)
+    each(insrt^wgs.inserts) fd.write(insrt.setup)
+    fd.write(strings.join(wgs.stateSyms.{this.toDecl}, "\n"))        // decl state
+    fd.write("\n")
+    fd.write("\n\tconst [errorMessage, setErrorMessage] = useState('')\n")       // state for error messages
+    each(jsseg^wgs.js) fd.write(specfile[jsseg.start...jsseg.finish] + "\n")   // insert javascript from spec
+    val setAts = wgs.stateSyms.[typ.lists > 0].{ this.toSetAt }
+    fd.write(strings.join(setAts, "\n"))          // insert any set*At ftn defns
+    fd.write("\n")
+    each(respKV^wgs.responseSymbols) {
+        fd.write("function decode#{strings.toCap(respKV.key)}(resp) {\n")
+        each(ssym^respKV.value.syms) fd.write(callSetState(ssym.ident, "resp." + ssym.ident))
+        fd.write("}\n")
+    }
+    // now for transition related defns
+    val generateTransFn = \imp(transn: transT, prcl: string) {
+        // the signature of the Trans fn includes the explicitly typed args
+//        println("generating for ", transn.ident)
+        val maybeHook = \(rp: responsePart) {
+            val rc = rp.respcall
+            if(rc.count == 0) ""
+            else {
+                val args = rc[1...rc.count].{ `okobj.` + this }
+                rc[0] + "(#{strings.join(args, `,`)})\n"
+            }
+        }
+        val bdgpts = transn.requests.[!this.isState].{info}
+        val params = strings.join(transn.requests.{ info.ident + ": " + info.ident }, ", ")
+        val funargs = strings.join(bdgpts.{ident}, ", ")
+        val errhookIndex = transn.response[pgname == "error" => index]
+        var errorHook = errhookIndex == nil ? "" : maybeHook(transn.response[errhookIndex])
+        var editedResponses = copy(transn.response)
+        if(errhookIndex != nil) editedResponses.removeIndex(errhookIndex)
+        val pathpfx = deploy ? "'http://localhost:#{portnum}/_be_/" : "'http://localhost:#{portnum}/"
+        var getpostArgs = pathpfx + dequotify(transn.path) + "/'"
+        if(params != "") getpostArgs += (prcl == "get" ? ", {params: {#{params}}}" : ", {#{params}}")
+        val updates = bdgpts.[wgs.stateSyms.keyIn(ident)].{ callSetState(ident, ident) }
+        // either call decode fn or open code response lit
+        var decodeStrg0 = "if(resp0.data.error !== '') {\n\t\tsetErrorMessage(resp0.data.error); #{errorHook}\n} else {\n"
+        if(transn.response.count > 0) {
+            val resp0 = transn.response[0]
+            if(resp0.respsym != "" || resp0.resplit.count > 0 || resp0.respcall.count > 0)
+                decodeStrg0 += "const okobj = resp0.data.ok;\n"
+        }
+        val setRespState = \(resp:responsePart) {
+            if(resp.respsym != "") "\t\tdecode#{strings.toCap(resp.respsym)}(okobj);\n"
+            else if(resp.resplit.count > 0) {
+                val litstmts = resp.resplit.{ callSetState(this.ident, "okobj." + this.ident) }
+                strings.join(litstmts, "\n")
+            } else ""
+        }
+        val updatePage = \imp(rp: responsePart) {
+            var rslt = ""
+            if(rp.pgname != "") {
+                each(insrt^wgs.inserts) {
+                    val pginx = insrt.pages[this == rp.pgname => index]
+                    if(pginx != nil) {
+                        rslt = "set#{strings.toCap(insrt.gensym)}(#{pginx});\n"
+                        break
+                    }
+                }
+            }
+            rslt
+        }
+        val oneResponse = \imp(rp: responsePart) {
+            rp.respsym == "error" ? "" : setRespState(rp) + maybeHook(rp) + updatePage(rp)
+        }
+        val decodeResponse = \imp(resps: list(responsePart)) {
+            var errhook = resps[pgname == "error"]
+            if(errhook != nil) { errorHook = maybeHook(errhook); println("got errhook:", errhook.respcall) }
+            if(resps.count == 1) oneResponse(resps[0])
+            else if(resps.count == 0) ""
+            else {
+                // generate ITE chain based on value of shared first slot
+                val chain = resps.{
+                    if(index == 1) println("decodeResponse: ", this)
+                    "if(resp0.data.respinx === #{index}) {\n" + oneResponse(this)
+                }
+                strings.join(chain, "\n} else ") + "\n\t\t} else alert('webgen translator fail')\n"
+            }
+        }
+        fd.write("function #{transn.ident}(#{funargs}) {\n")
+        fd.write(strings.join(updates, ""))
+        fd.write("axios.#{prcl}(#{getpostArgs})\n.then(resp0 => {\n\t\t\t#{decodeStrg0}#{decodeResponse(editedResponses)}\n")
+        fd.write("}}).catch(error => {\nconsole.log('error in #{transn.ident}', error);\n})")
+        fd.write("}\n")
+    }
+    val generatePage = \(pgnm: string, pgi: psinfoT) {
+        fd.write("function #{pgnm}() {\n")
+        fd.write("return(\n<>\n")
+        fd.write("<ErrorPopup msg={errorMessage} clearMsg={e => setErrorMessage('')} />\n")
+        fd.write(pgi.interned.generateJSX(wgs))
+        fd.write("</>\n)}\n")
+    }
+    each(trans^wgs.transitions.values) generateTransFn(trans, trans.isGet ? "get" : "post")
+    each(pg^wgs.pages) generatePage(pg.key, pg.value)
+    if(wgs.transitions["onLoad"] != nil) {
+        fd.write("useEffect(() => {\nonLoad(); }, [])\n")
+    }
+    if("initialPage" in wgs.pages.keys) fd.write("\n\treturn initialPage();")
+    else fd.write("\n\treturn pgcount0Map[0]();")
+    fd.write("\n}\nexport default App;\n")
+    fd.close()
+}
+
+val writeAppCSS = \imp(wgs: wgState, dir: string, specfile: list(byte)) {
+    var fd = file.createWithError(dir + "/App.css")
+    if(tag(fd) == :err) { println(fd); return }
+    each(cf^wgs.compFiles) each(compnt^cf.comps.[usecount > 0]) fd.write(compnt.cssDefs)
+    each(cssseg^wgs.css) fd.write(specfile[cssseg.start...cssseg.finish] + "\n")   // insert css from spec
+    fd.write(boilerplate.client.css)     // and global defns from boilerplate
+    fd.close()
+}
+
+// Copy the user defined components to the target directory
+val copyComponents = \imp(wgs: wgState, targetDir: string) {
+    each(srcdir^wgs.forCopy) {
+        var args = srcdir.files.{ srcdir.dirname + "/" + this.filename }
+        args.pushf("-p")
+        args.pushb(targetDir)
+        val cp = exec.Command("cp", args).CombinedOutput()
+        if(cp.err != nil) exit(cp.err)
+        println("cp ", strings.join(args, " "))
+    }
+}
+
+val writeServer = \imp(wgs: wgState, specfile: list(byte), fnm:string) {
+    // make a server file that encodes the filename (minus .d8m) and port number
+    val srvrFnm = "#{fnm[0...fnm.count-4]}SrvrPort#{portnum}.d8m"
+    println("writeServer", srvrFnm)
+    var usesFlag = false
+    var fd = file.createWithError(srvrFnm)
+    if(tag(fd) == :err) { println(fd); return }
+    fd.write(boilerplate.server.imports)
+    fd.write(boilerplate.server.setup)
+    // write object defns
+    each(obj^wgs.objdefns) fd.write(obj.toD8mDecl)
+    // write text segments
+    each(d8mtext^wgs.d8m) {
+        val segment = specfile[d8mtext.start...d8mtext.finish]
+        fd.write(segment); fd.write("\n")
+        if(bytes.index(segment, cvt("method commandLine", list(byte))) >= 0) usesFlag = true
+    }
+    // synthesize the runServer ftn that sets up the various HandleFuncs then calls ListenAndServe
+    fd.write("val runServer = \\mod(sv:runstateT) {\n")
+    if(usesFlag) fd.write("sv.commandLine()\n")
+    if(deploy) {
+        // create static server for /; assume server will live in the build/ dir
+        fd.write("val fs = http.FileServer(http.Dir(`.`))\n")
+        fd.write("http.Handle(`/`, fs)\n")
+    }
+    each(trans^wgs.transitions) {
+        val tnm = trans.key, tval = trans.value
+        var stmts: string
+        if(tval.isGet) {
+            val actuals = tval.requests.{ this.info.ident }
+            val accessCntl = deploy ? "" : "\nw.Header().Add(`Access-Control-Allow-Origin`, `*`)\n"
+            stmts = strings.join(tval.requests.{ this.info.toGetParam }, "\n") + accessCntl +
+                "fmt.Fprint(w, sv.#{tval.actionfn}(#{strings.join(actuals, `, `)}).encode())\n}"
+        } else {
+            // todo: this dumb code limits POST requests to 5000 bytes. Add ContentLength to defn of import go "net/http" and use it.
+            // note that the extra header and the OPTIONS check are there to make CORS work.
+            stmts = `w.Header().Add("Content-Type", "application/json"); `
+            unless(deploy) {
+                stmts += `w.Header().Add("Access-Control-Allow-Origin", "*")
+                     w.Header().Add("Access-Control-Allow-Headers", "Content-Type")
+                     if(r.Method == "OPTIONS") {
+                         fmt.Fprint(w, [actionfnRettype: "", 0, ""].encode())
+                     } else {
+                         val bodybuff: list(byte) = zerolist(5000)
+                         val rdrslt = r.Body.Read(bodybuff)
+                         `
+                stmts += "fmt.Fprint(w, sv.#{tval.actionfn}(bodybuff[0...rdrslt.ok]).encode())\n\t\t\t\t\t\t}\n\t\t\t\t\t}"
+            } else {
+                stmts += `
+                        val bodybuff: list(byte) = zerolist(5000)
+                        val rdrslt = r.Body.Read(bodybuff)`
+                stmts += "\n\t\t\t\tfmt.Fprint(w, sv.#{tval.actionfn}(bodybuff[0...rdrslt.ok]).encode())\n\t\t\t\t\t}"
+            }
+        }
+        val hfstring = "\nhttp.HandleFunc(\"/#{dequotify(tval.path)}/\", #{tnm})\n"
+        fd.write("val #{tnm}:http.HandleFuncThunk = \\imp(w:http.ResponseWriter, r:http.Request) {\n" + stmts + hfstring)
+    }
+    fd.write("http.ListenAndServe(`:#{portnum}`, nil)\n}\nrunServer(progstate)\n")
+    fd.close()
+}
+
+val driver = \imp() {
+    flag.Parse()
+    val args = flag.Args()
+    if(args.count != 1) exit("missing filename argument: expecting 'webgen {-client=path specfile.d8m'")
+    unless(file.quickCheck(clientDir) == 1) exit("#{clientDir} must be a directory")
+    println("target is", clientDir)
+    // get fname and split it into path and filename proper
+    var fname = args[0]
+    val arglen = fname.count
+//    each(bb^wgDefn.bblocks) println(bb)
+    if(arglen < 4 || fname[arglen-4...arglen] != ".d8m") fname += ".d8m"
+    var ps = [parseState: wgDefn]
+//    each(nt^wgDefn.allNonterms, ntinx) {print("nt: #{ntinx} #{nt.name} #{nt.binx}; rules="); each(rl^nt.rules) {print(rl); print("; ")}; println() }
+//    each(inx^0...wgDefn.bblocks.count) println("bblk:", ps.defn.prBBlock(inx))
+//    println("exprFirst:"); each(ef^wgDefn.exprFirst) println(ef)
+//    println("exprFollow:"); each(ef^wgDefn.exprFollow) println(ef)
+//    println("FirstTkns:"); each(ft^wgDefn.allNonterms) println(ft.name, ":", ft.FirstTkns)
+    ps.tokenCheck = fixD8mLabels        // this langDefn extends d8m so add the label fixup hook defined in pmzparse
+    val parseables = ["transition", "state", "pagespec", "response", "components", "object", "source", "html"]
+    val reservedSVNames = ["errorMessage"]      // more to come?
+
+    //each(inx^0...wgDefn.bblocks.count) println("bblk:", ps.defn.prBBlock(inx))
+    val specfile = file.openStream(fname)
+    var wgs = [wgState: specfile.contents]
+    ps.bytes = specfile.contents; ps.cxt.clear()
+    ps.nxToken()
+    while(ps.cxt.toktype != "end") {
+        if(ps.error != nil) wgs.error = asString(ps.error)
+        if(wgs.error != "") break
+        val tkn = ps.cxt.tknval
+        val b4 = ps.cxt.ofs - tkn.count
+        //println("first token:", tkn)
+        if(tkn in parseables) {
+            var trm = ps.parseStmt()
+            val after = ps.prevtkn.ofs
+            if(trm == nil) { assert ps.error != nil; wgs.error = asString(ps.error); break }
+            case {
+                trm.kind == "statestmt" => {
+                    each(decl^asTerms(trm.child0)) {
+                        val ssym = [stateSymT: decl]
+                        if(ssym.typ.leaf == :error) { wgs.error = "bad type in decl of #{ssym.ident}"; break }
+                        if(wgs.stateSyms.keyIn(ssym.ident)) { wgs.error = "duplicate definition of #{ssym.ident}"; break }
+                        if(ssym.ident in reservedSVNames || (ssym.ident.count > 7 && ssym.ident[0..6] == "pgcount")) {
+                            wgs.error = ssym.ident + " is a reserved identifier"
+                            break
+                        }
+                        wgs.stateSyms.insert(ssym)
+                    }
+                }
+                trm.kind == "respstmt" => {
+                    val ident = asString(trm.child0)
+                    if(wgs.responseSymbols[ident] != nil) {
+                        wgs.error = "duplicate definition of #{ident}"
+                        break
+                    }
+                    val resplit = asTerms(trm.child1.child0)     // get the identlist args
+                    // check for errors and add this one if there are none
+                    val notState = resplit[!wgs.svIdent(this)]
+                    unless(notState == nil) {
+                        wgs.error = "#{asString(notState)} is not a known state symbol"
+                        break
+                    }
+                    wgs.responseSymbols[ident] = [responseT: resplit.{ wgs.stateSyms.getOK(asString(this)) }]
+                }
+                trm.kind == "transitionstmt" => {
+                    val transident = asString(trm.child0)
+                    val path = asString(trm.child1), req = trm.child2(), action = trm.childN(3)
+                    val getpost = asLeaf(req.child0)
+                    // request can be empty
+                    val reqitems:list(Term) = asTerms(req).count > 1 ? asTerms(req.child1) : []
+                    // The request items are state symbols unless qualified with types
+                    val notState = reqitems[asTerms(this).count == 1 && !wgs.stateSyms.keyIn(asLeaf(this))]
+                    unless(notState == nil) {
+                        wgs.error = "#{asLeaf(notState)} is not a known state symbol"
+                        break
+                    }
+                    var transn = [transT: transident, getpost == "GET", path, asString(action), [], []]
+                    each(item^reqitems) {
+                        var req0:requestT
+                        if(asTerms(item).count == 1) {
+                            req0 = [requestT: true, wgs.stateSyms.getOK(asLeaf(item))]
+                        } else {
+                            // here we use stateSymT just to hold ident+type; these aren't declared as state
+                            req0 = [requestT: false, [stateSymT: item]]
+                        }
+                        transn.requests.pushb(req0)
+                    }
+                    // response is optional
+                    if(asTerms(trm).count > 4) {
+                        val response = trm.childN(4)    // will be "responsex" with 1-3 children
+                        // each child is a "respx" with 1=3 children, the possible configs are
+                        // 1: [ident] [responselit]
+                        // 2: [ident, ident] [ident, responselit] [ident, funcall]
+                        // 3: [ident, ident, funcall] [ident, ident, funcall] [ident, responselit, funcall]
+                        // If 2 idents are present, the first is always a page, the second must be a response object.
+                        // If 1 ident, we can always tell if it's a page or response obj by lookup.
+                        each(respx^asTerms(response)) {
+                            // Respx is a single option, ie what is separated by "or" in the stx.
+                            var respargs = asTerms(respx)
+                            assert respargs.count != 0
+                            var rsident = ""
+                            var respsyms:list(stateSymT)
+                            var hook:list(string) = []
+                            if(respargs.last.kind == "funcall") {
+                                val fcargs = asTerms(respargs.last)
+                                unless(fcargs.count >= 1 && fcargs[0].kind == "ident") {
+                                    wgs.error = "wrong form for hook argument in #{transident} transition"
+                                    break
+                                }
+                                hook.pushb(asString(fcargs[0]))
+                                val hookargs: list(Term) = fcargs.count == 1 ? [] : asTerms(fcargs[1])
+                                each(fcarg^hookargs) {
+                                    unless(fcarg.kind == "ident") { wgs.error = "arg to hook must be identifier"; break }
+                                    hook.pushb(asString(fcarg))
+                                }
+                            }
+                            var pgarg = ""
+                            if(respargs[0].kind == "ident") {
+                                val respid = asString(respargs[0])
+                                val respval = wgs.responseSymbols[respid]
+                                if(respval == nil) pgarg = respid else rsident = respid
+                            } else if(respargs[0].kind == "responselit") {
+                                val badStrg = asTerms(respargs[0].child0)[!wgs.svIdent(this)]
+                                unless(badStrg == nil) {
+                                    wgs.error = "#{asString(badStrg)} is not a known state symbol"
+                                    break
+                                }
+                                respsyms = asTerms(respargs[0].child0).{ wgs.stateSyms.getOK(asString(this)) }
+                            }
+                            if(respargs.count > 1 && respargs[1].kind != "funcall") {
+                                val resparg = respargs[1]
+                                if(resparg.kind == "ident") {
+                                    val respid = asString(resparg)
+                                    val respval = wgs.responseSymbols[respid]
+                                    if(respval == nil) {
+                                        pgarg = respid
+                                        if(asTerms(respx).count == 2) { wgs.error = "#{respid} is not a response symbol"; break }
+                                    } else rsident = respid
+                                } else {
+                                    val badStrg = asTerms(resparg.child0)[!wgs.svIdent(this)]
+                                    unless(badStrg == nil) {
+                                        wgs.error = "#{asString(badStrg)} is not a known state symbol"
+                                        break
+                                    }
+                                    respsyms = asTerms(resparg.child0).{ wgs.stateSyms.getOK(asString(this)) }
+                                }
+                           }
+                           transn.response.pushb([responsePart: pgarg, rsident, respsyms, hook])
+                        }
+                        if(wgs.error != "") break
+                    }
+                    wgs.transitions[transident] = transn
+                }
+                trm.kind == "pgstmt" => {        // just record for now, we'll process later
+                    val pgident = asString(trm.child0)
+                    if(wgs.pages[pgident] != nil) { wgs.error = "page #{pgident} already declared"; break }
+                    wgs.pages[pgident] = [psinfoT: trm.child1, makeEmptyPTerm(""), 0, ""]
+                    wgs.pagesDefnOrder.pushb(pgident)
+                    //println("page:", pgident, trm.child1)
+                }
+                trm.kind == "compstmt" => {
+                    if(trm.child0.kind == "identlist") {
+                        // I think the arg here should be a list of idents but another level of identlist is possible
+                        // (at least as of 01/01/23) and rather investigate lexparse to understand and maybe fix this, I accommdate.
+                        // The all idents assumption allows val used = asTerms(trm.child0).{ asString(this) }
+                        var used: list(string)
+                        each(x^asTerms(trm.child0)) {
+                            if(x.kind == "ident") used.pushb(asString(x))
+                            else each(x1^asTerms(x)) used.pushb(asString(x1))   // handle 1 level of identlist
+                        }
+                        each(c^used) {
+                            var compnt = wgs.comps.get(c)
+                            if(compnt == nil) { wgs.error = c + " is not a declared component (#{wgs.location(trm)})"; break }
+                            compnt.usecount = 1
+                        }
+                    } else {
+                        val dirname = asLeaf(trm)
+                        val cRead = readComponents(dequotify(dirname))
+                        val cReadError = wgs.processComponentsRead(cRead, dirname)
+                        if(cReadError != "") { wgs.error = cReadError; break }
+                    }
+                }
+                trm.kind == "objstmt" => {
+                    val objident = asString(trm.child0)
+                    val attribTerms = asTerms(trm.child1)
+                    var atrbs: list(bdgpt) = []
+                    each(colonpair^attribTerms) {
+                        val ident = asString(colonpair.child0)
+                        val typ = [wgType: colonpair.child1]
+                        atrbs.pushb([bdgpt: ident, typ])
+                    }
+                    val obj = [objdefT: objident, atrbs]
+                    //println("adding object:", obj)
+                    wgs.objdefns.pushb(obj)
+                }
+                trm.kind == "sourcestmt" => {
+                    val pkgname = dequotify(asString(trm.child0))
+                    val propdescs = asTerms(trm.child1)
+                    val compnames = asTerms(trm.child2).{ asString(this) }
+                    val propnames = propdescs.{ asString(this.child0) }
+                    val proptypes = propdescs.{ [wgType: this.child1] }
+                    // optional is the default: unless there's a third arg equal to "required"
+                    val optionals = propdescs.{ val trm0 = asTerms(this); trm0.count == 2 || asString(trm0[2]) != "required" }
+                    // take care to allow multiple source stmts on the same pkgname, eg to access components with different sets of props
+                    val compinx = wgs.compFiles[filename == pkgname => index]
+                    var compfile = compinx == nil ? [componentFile: "", pkgname] : wgs.compFiles[compinx]
+                    compfile.fromSource = true
+                    val props = [nm~propnames, typ~proptypes, opt~optionals].xp.{ [componentArg: nm, stringify(typ), opt, false] }
+                    // create components, add to compfile and wgs.comps...
+                    each(cnm^compnames, inx) {
+                        val compnt = [componentT: cnm, props, false]
+                        compfile.comps.pushb(compnt)
+                        wgs.comps.insert(compnt)
+                    }
+                    if(compinx == nil) wgs.compFiles.pushb(compfile)
+                }
+                trm.kind == "htmlstmt" => {
+                    val htmlvbl = asString(trm.child0)
+                    val filespec = dequotify(asString(trm.child1))
+                    wgs.htmls.pushb([htmlfileT: htmlvbl, filespec])
+                }
+            }
+        } else {
+            if(ps.scanStmt() < 0) ps.nxToken()
+            val after = ps.prevtkn.ofs
+            var seg = [textsegment: b4, after]
+            if(tkn == "javascript") wgs.js.pushb(bracetrim(seg, ps.bytes))
+            else if(tkn == "css") wgs.css.pushb(bracetrim(seg, ps.bytes))
+            else wgs.d8m.pushb(seg)
+            //val strgform = b4 <= after ? cvt(ps.bytes[b4...after], string) : "!!!!!"
+            //println("start: #{b4}; end: #{after}", strgform)
+        }
+    }
+    if(wgs.error != "") { println(wgs.error); return }
+    // phase 2: typecheck pagespecs, check mentions of same in transition responses, prep for output
+    each(pgspec^wgs.pages) {
+        val ptrm = wgs.checkPage(pgspec.value.postparse, pgspec.key)
+        if(ptrm.ident == "ERRORTC") { wgs.error = asError(ptrm); println(wgs.error); break }
+        pgspec.value.interned = ptrm
+    }
+    // Do init page checking+defaulting
+    val ipnm = "initialPage"
+    if(wgs.pages[ipnm] == nil) {
+        val insertnm = "pgcount#{wgs.inserts.count}"
+        wgs.stateSyms.insert([stateSymT: insertnm])
+        val insertAll = [insertInfo: insertnm, wgs.pagesDefnOrder, ipnm, ""]
+        println("insertAll:", insertAll)
+        wgs.pages[ipnm] = [psinfoT: [Term: "", "", 0], [PTerm: "Insert", [Term: "ident", insertnm, 0]], 0, ipnm]
+        wgs.inserts.pushb(insertAll)
+    } else {
+        // an initialPage was defined; check that all pages are refncd
+        each(pg^wgs.pages)
+            if(pg.value.pageinx == 0 && pg.key != "initialPage") { wgs.error = "page #{pg.key} is unused"; println(wgs.error); return }
+    }
+    // check pgspec refncs in transT.response slots
+    each(transKV^wgs.transitions) {
+        each(respair^transKV.value.response) {  // respair is tuple(pgname:string, response:responseT)
+            unless(respair.pgname == "" || wgs.pages[respair.pgname] != nil || respair.pgname == "error") {
+                wgs.error = "not a page name: #{respair.pgname} in transition #{transKV.key}"
+                break
+            }
+        }
+    }
+    if(wgs.error != "") { println(wgs.error); return }
+//    each(trns^wgs.transitions) println(trns.key, "=", trns.value)
+    //println("************ App.js ************")
+    unless(deploy) {
+        wgs.writeAppJS(clientDir, ps.bytes)
+        wgs.writeAppCSS(clientDir, ps.bytes)
+        wgs.copyComponents(clientDir)
+    }
+    wgs.writeServer(ps.bytes, fname)
+}

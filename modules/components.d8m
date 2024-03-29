@@ -1,0 +1,197 @@
+// Components is structured as a module local to webgen. It exports readComponents, which scans a directory
+// and returns a componentsReader, which is a specially crafted type with info about the components found therein.
+// The idea is that the caller processes the componentsReader into the desired form.
+// It assumes it is imported into an environment where lexparse is loaded, so those defns are active. Also, it assumes
+// that types componentFile and componentT are defined (in a particular way).
+// And regexp module is imported as rxp.
+
+import go "os"
+
+export componentsReader, readComponents
+
+// here's the "specially crafted" componentsReader
+val componentsReader = tuple(compFiles: list(componentFile), error: string)
+
+// Define a grmr to find component definitions. It defines seqs of // lines as strings.
+val compdefTclasses = [[tknclassSpec: "strg", "^(//[^\n]*\n+)+"], [tknclassSpec: "int", ""], [tknclassSpec: "flt", ""]]
+val compdefProdn = [[rawProdn: "compdef", :stmt, "expr function ident ( props )"]]
+val findCompdefs = [langDefn: [], compdefProdn, compdefTclasses, ["function", "props"], [], [], ["(", ")"], false]
+
+// next, another nonstd grmr for searching in the comments; we'll only use its tokenizer, since it's not all that
+// convenient to treat the required FSM as a grammar.
+val findArgs = [langDefn: [], [], [], [], [], [], ["(", ")", "."], false]
+
+// And a third just to grab the "ident : type " info in an arg. I treat colon as a postfix unop because type
+// info can be structured (ie more complex than an ident) and I don't want to parse it. So the process is to
+// get a "colon" expr and set type to the remainder of the arg string.
+val findOneArg = [langDefn: [[": colon postfix"]], [], [], [], [], [], [], false]
+
+// It's easy so why not do it a lot. I figured out later that I need to check for imports in these component defns
+// that require things to be copied into the target as local components. So I rescan with yet another grmr.
+val importProdns = [[rawProdn: "identlist", :general, "ident"],
+        [rawProdn: "identlist", :general, "ident , identlist*"],
+        [rawProdn: "importstmt", :stmt, "import ident from strg"],
+        [rawProdn: "importstmt", :stmt, "import { identlist } from strg"]]
+
+val findImports = [langDefn: [], importProdns, [], ["import", "from"], [], [], ["{", "}"], false]
+
+// like webgen dequotify but for javascript literals
+val dequotifyJS = \imp(strg: string) {
+    if(strg[0] != '"' && strg[0] != '\'') strg
+    else if(strg[1...3] == "./") strg[3...strg.count-1]
+    else strg[1...strg.count-1]
+}
+
+val scan4Import = \mod(cf:componentFile, bytes:list(byte)) {
+    var ps = [parseState: findImports]     // create a parser for finding component defns
+    ps.bytes = bytes
+    var rslt: list(componentT) = []
+    ps.nxToken()
+    while(ps.cxt.toktype != "end") {
+        if(ps.cxt.tknval == "import") {
+            val istmt = ps.parseStmt()
+            if(istmt != nil && istmt.kind == "importstmt") {
+                val isstrg = asString(istmt.child1)
+                if(isstrg.count > 2) {
+                    var sval = dequotifyJS(isstrg)
+                    //println("in scan4Import, cf=", cf.filename, "; isstrg=", isstrg, "; sval=", sval)
+                    cf.imports.pushb(sval)
+                }
+            }
+        }
+        ps.nxToken()
+    }
+}
+
+// Open the named file and search for component defns, returning descrs for any found.
+val scan4Component = \imp(filename, dirname: string) -> componentFile {
+    var fd = file.openBasic(filename)     // this can't fail (?) since the filename came from ReadDir
+    val bytes: list(byte) = zerolist(fd.size())
+    fd.read(bytes)
+    var retval = [componentFile: dirname, filename]
+    retval.modtime = fd.modtime()
+    fd.close()
+
+    var ps = [parseState: findCompdefs]     // create a parser for finding component defns
+    ps.bytes = bytes
+    ps.nxToken()
+    while(ps.cxt.toktype != "end") {
+        if(ps.error != nil) ps.error = nil    // reset error else it screws up tokenizer
+        if(ps.cxt.toktype == "strg") {
+            val ofs0 = ps.cxt.ofs - ps.cxt.tknval.count
+            val compdef = ps.parseStmt()
+            if(compdef != nil && compdef.kind == "compdef") {
+                val compargs = compdef.asTerms
+                val filepart = [textsegment: ofs0, ps.cxt.ofs - ps.cxt.tknval.count]
+                var nxcomp = [componentT: compargs[1].asString, [], false]
+                val comments = compargs[0].asString
+                val accepts = [rxp.regexpT: "(accepts props)|(accepts the prop)"]
+                val accPos = accepts.findIndex(comments)
+                if(accPos != []) {
+                    var ps0 = [parseState: findArgs]
+                    ps0.bytes = comments[accPos[1]...comments.count]
+                    ps0.nxToken()
+                    while(ps0.cxt.toktype != "end" && ps0.cxt.tknval != ".") {      // terminate at . or end of comments
+                        // The default string literal includes backtick string so each props def should be a string optionally followed by lparen, "optional", rparen.
+                        if(ps0.cxt.toktype == "strg" && ps0.cxt.tknval[0] == '`') {
+                            // collect an argument
+                            val posN = ps0.cxt.ofs - 1          // ps0.cxt.ofs is end of this token; -1 strips trailing backtick
+                            val pos0 = posN - (ps0.cxt.tknval.count - 2)    // -2 strips initial backtick
+                            // use yet another parser/tokenizer to collect the arg, it parses : as infix binop
+                            var ps1arg = [parseState: findOneArg]
+                            val argfrag = ps0.bytes[pos0...posN]
+                            ps1arg.bytes = argfrag
+                            ps1arg.nxToken()
+                            val argterm = ps1arg.parseStmt()
+                            if(argterm == nil || argterm.kind != "colon") {
+                                println("can't parse arg at", cvt(argfrag, string), "(while reading #{nxcomp.compnm})")
+                                break
+                            }
+                            // argterm will be a colon expr with ident arg; cxt positioned at type part
+                            var arginf0 = [componentArg: argterm.asTerms[0].asString,
+                                cvt(argfrag[ps1arg.prevtkn.ofs...argfrag.count], string), false, false]
+                            // now check for optionality and adjust arginf0 if needed
+                            ps0.nxToken()
+                            if(ps0.cxt.tknval == "(") {
+                                ps0.nxToken()
+                                if(ps0.cxt.tknval == "optional") arginf0.optional = true
+                            }
+                            if(nxcomp.args[this.argname == arginf0.argname] != nil) {
+                                println("redeclaration of component arg", arginf0.argname)
+                                break
+                            }
+                            nxcomp.args.pushb(arginf0)
+                            unless(arginf0.optional) nxcomp.minargs += 1
+                            // don't count children in minargs, treat it as optional since it's handled separately
+                            if(arginf0.argname == "children") { nxcomp.hasChildren = true; nxcomp.minargs -= 1; arginf0.optional = true }
+                        } else ps0.nxToken()
+                    }
+                }
+                retval.comps.pushb(nxcomp)
+            }
+        } else ps.nxToken()
+    }
+    if(retval.comps.count > 0) scan4Import(retval, bytes)
+    retval
+}
+
+// Read the named directory; create and return a componentsReader to describe what we found.
+val readComponents = \imp(dirname: string) {
+    var retval = [componentsReader: [], ""]
+    val rddir = os.ReadDir(dirname)
+    if(rddir.err != nil) { retval.error = "can't read " + dirname; return retval }
+    val hasCss = rddir.ok[this.Name() == "All.css"] != nil
+    unless(hasCss) { retval.error = "#{dirname} is missing 'All.css' file"; return retval }
+    val jsfiles = rddir.ok.[strings.endsWith(this.Name(), ".js")]
+    // to simplify filename mgmt, we cd to the dir and restore the wd afterwards
+    val curwd = os.Getwd()
+    os.Chdir(dirname)
+    each(jsf^jsfiles) {
+        val cf = scan4Component(jsf.Name(), dirname)
+        if(cf.comps.count > 0) {
+            retval.compFiles.pushb(cf)
+        }
+    }
+    // next, scan the All.css file and put definitions a/w components into the corresponding component
+    var fd = file.openBasic("All.css")     // this can't fail since we checked existence earlier
+    val nbytes = fd.size()
+    val bytes: list(byte) = zerolist(nbytes)
+    fd.read(bytes)
+    fd.close()
+    val recordSegment = \imp(s, compnm: string) {
+        //println("recordSegment for #{compnm}:", s)
+        each(cf^retval.compFiles, compnt^cf.comps) {
+            //println(cf.filename, "--", compnt.compnm)
+            if(compnt.compnm == compnm) {
+                compnt.cssDefs = s
+                //println("found in", cf.filename)
+                break
+            }
+        }
+    }
+    //println("All.css #{nbytes} bytes long")
+    val startptn = [rxp.regexpT: `\n[ \t]*/\* component +`]
+    val identptn = [rxp.regexpT: `[A-Za-z_][A-Za-z_0-9]*`]
+    var curstart = 0, compnm = ""
+    // scan file; recording defn strings with a delay
+    loop {
+        val posn = startptn.findIndex(bytes[curstart...nbytes])
+        //println("posn", posn)
+        if(posn.count == 0) break
+        val idend = identptn.findIndex(bytes[curstart+posn[1]...nbytes])
+        //println("idend", idend)
+        if(idend.count > 0) {
+            // if curstart > 0, there's an existing compnm that we want to use
+            if(curstart > 0) recordSegment(cvt(bytes[curstart...curstart+posn[0]], string), compnm)
+            compnm = cvt(bytes[curstart+posn[1]...curstart+posn[1]+idend[1]], string)
+            curstart += idend[1]
+            while(bytes[curstart] != '\n') curstart += 1
+            curstart += 1
+            //println("curstart is now", curstart)
+        }
+    }
+    // here's the delay:
+    if(curstart > 0) recordSegment(cvt(bytes[curstart...nbytes], string), compnm)
+    os.Chdir(curwd.ok)
+    retval
+}

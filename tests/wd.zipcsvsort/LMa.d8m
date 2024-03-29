@@ -1,0 +1,127 @@
+import go "math/rand"
+import go "time"
+import go "flag"
+
+
+// # Small App Benchmark
+// 
+// This perfspec reads a zipped archive containing a single csv file with ~162K rows, 
+// extracts and reads selected columns of the csv file, then do some calculations, detailed below,
+// that involve sorting another other operations.
+//
+// The cvs file is from the 2010 US census, and starts with a header row; the first 3 rows are
+//
+//     name,rank,count,prop100k,cum_prop100k,pctwhite,pctblack,pctapi,pctaian,pct2prace,pcthispanic
+//     SMITH,1,2442977,828.19,828.19,70.9,23.11,0.5,0.89,2.19,2.4
+//     JOHNSON,2,1932812,655.24,1483.42,58.97,34.63,0.54,0.94,2.56,2.36
+//
+// It's a file of last names and counts; the last 6 cols are fractions by race. So whereas 71% of Smiths are white,
+// only 59% of Johnsons are.
+//
+// The tasks are (1) names and total count of whitest names that constitute 30% of whites; (2) names and total count of names
+// that constitute 60% of hispanic. I'm going to assume we need to extract the #'s of whites and hispanics from the data.
+// So the steps are (1) calc total # of whites and hispanics; (2) sort on pctwhite then count and grab until you hit 30%;
+// (3) same for hispanic.
+//
+// The perfspec has no parameters; the outputs form a timeseries and identify the steps along the way.
+
+import go "archive/zip"
+import "csv"
+import "sort"
+import go "time"
+
+val zipCvsSort = \imp() {
+    var t0:time.Time = time.Now()
+    val openzip = zip.OpenReader("../nms.zip")
+    if(openzip.err != nil) exit(openzip.err)
+    // Get the first (and only) file in the zip archive
+    var file0 = openzip.ok.File[0].Open()
+    if(file0.err != nil) exit(file0.err)
+    val filesz = openzip.ok.File[0].UncompressedSize64
+    // allocate a buffer to read the file chunk by chunk
+    val buff:list(byte) = zerolist(filesz)
+    var offset = 0, linenum = -1
+    while(offset < filesz) {
+        val readout = file0.ok.Read(buff[offset...filesz])
+        if(readout.ok > 0) offset += readout.ok
+        else break
+    }
+    // allocate a line reader, we'll fill it with chunks as we read them, then use it to spit out lines
+    var lineStreamer = [csv.splitSimple: buff, "\r\n", true]
+    // This one splits lines into fields
+    val reader = [csv.csvReaderT: ',', false, false]
+    // These are the fields we want to intern
+    val internT = tuple(lastname:string, count, wcount, bcount, acount, hcount:integer)
+    var dataset: list(internT) = []
+    var chunkcount = 0
+    val d1 = time.Since(t0)
+    //t0 = time.Now()
+    while(!lineStreamer.done()) {
+        // this skips the first line, which we want to skip for this file
+        val line = lineStreamer.next()
+        linenum += 1
+        val fields = reader.readline(copy(line))      // there will be 11
+        if(fields.count != 11) println("bad field count", fields.count)
+        // Each line's pctX allows to approximate the number of that race (or races) with that name
+        val fullcount = csv.field2Int(fields[2])
+        val extractF = \(fldinx:integer) {
+            val tmp = fields[fldinx] == "(S)" ? 0.0 : csv.field2Float(fields[fldinx])
+            if(tmp > 100.0) println("bad pct value", tmp)
+            round(tmp * fullcount / 100.0)
+        }
+        dataset.pushb([internT: fields[0], fullcount, extractF(5), extractF(6), extractF(7), extractF(10)])
+    }
+    dataset.popb()              // delete last line which is "all other names"
+    val d2 = time.Since(t0)
+    //t0 = time.Now()
+    var wtotal = 0, htotal = 0, alltotal = 0
+    each(elt^dataset) { wtotal += elt.wcount; htotal += elt.hcount; alltotal += elt.count }
+    // println("totals:", alltotal, wtotal, htotal)
+
+    val wtotal0 = cvt(wtotal, float)        // total count of whites
+    val htotal0 = cvt(htotal, float)        // total count of hispanics
+    var waccum = 0.0, haccum = 0.0
+    var wcount30 = 0, hcount30 = 0
+    val d3 = time.Since(t0)
+    //t0 = time.Now()
+    // sort on white
+    sort.modsort(dataset, \(a, b:internT) { a.wcount > b.wcount })
+    each(elt^dataset, inx) {
+        waccum += cvt(elt.wcount, float)
+        if(waccum/wtotal0 >= 0.3) { wcount30 = inx; break }
+    }
+    val d4 = time.Since(t0)
+    //t0 = time.Now()
+
+    // sort on hispanic
+    sort.modsort(dataset, \(a, b:internT) { a.hcount > b.hcount })
+    each(elt^dataset, inx) {
+        haccum += cvt(elt.hcount, float)
+        if(haccum/htotal0 >= 0.3) { hcount30 = inx; break }
+    }
+    val d5 = time.Since(t0)
+
+    //println("white: #{wcount30} of #{wtotal}; hispanic: #{hcount30} of #{htotal}")
+    print(round(cvt(d1,float) * 1e-6))
+
+    print(`,`, round(cvt(d2,float) * 1e-6))
+
+    print(`,`, round(cvt(d3,float) * 1e-6))
+
+    print(`,`, round(cvt(d4,float) * 1e-6))
+
+    print(`,`, round(cvt(d5,float) * 1e-6))
+
+}
+
+
+
+
+var seed:integer = flag.Int(`seed`, 0, ``)
+val runQuery = \imp() {
+flag.Parse()
+if(seed != 0) rand.Seed(seed)
+zipCvsSort()
+println()
+}
+runQuery()

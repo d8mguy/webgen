@@ -1,0 +1,339 @@
+// ExtractChartData is a large method in pfsFESpec. Test it in situ.
+
+// Diffs: actionfnRettype is replaced by tuple(contents:string, isError:boolean)
+
+import "dataTable" as dtbl
+import "matrix" as mtx
+import "combics" as strms
+import "num/lininterp"
+import "strings"
+import "codecs/json"
+import "file"
+import go "flag"
+import "regexp"
+
+import "perfsis/types" melted
+
+// This has info on visual aspects of a ChartPart
+val Visual = tuple(
+	geom: string,        // should be 'Line', 'Bar', 'Dot' as in the UI
+	thickness: integer,  // 0 to 4
+	hue: integer        // 0 to 360 for HSL color repn
+)
+
+val ChartPart = tuple(
+    source: string,             // "" for perfspec cube (at index 0), else identifier in frontendInfo.externals
+    // allDimsIndices are -1,-2,-3 for abscissa, clickable, multi. And >= 0 for specific bindings.
+    allDimsIndices: list(integer),
+    outputs: list(integer),
+    compareWithSubstn: list(integer),      // only in part 0; if [a,b] encodes that compareWith selected element b in substn a.
+    appnc: Visual     // note: these are ignored for getting chart data but needed for saving charts.
+)
+
+// This gets sent to the server to get a ChartData; it's also the type used to save charts. The description
+// and the appnc slot of ChartPart isn't needed for ChartTrans but is needed for a saved chart.
+// For now, charts are single axis and limited to two parts, the first of which is the base part, data comes from
+// the perfspec proper; the second part, if present, comes from ExternalData.
+val ChartDesc = tuple(
+    title: string,           // this is the top line in the drawn chart (above the legend)
+    identifier: string,      // the identifier for saving (spaces ok, special chars maybe not)
+    parts: list(ChartPart),
+    unit: string,
+	hmdimIndex: integer,
+	outsAsAbscissa: boolean,
+	// next 4 allow direct control of y axis range
+	setYAxisLow: boolean,
+	setYAxisHigh: boolean,
+	YAxisLow: string,             // these are ignored unless the corresponding booleans are set
+	YAxisHigh: string,            // and they're floats, but javascript cnvn rules are so terrible that I've changed the type
+	// prop for comparison option when exactly two series: integers are 0-4 for none + [ratio,diff]*[1-2,2-1]
+	compareOptions: integer       // will be 0 unless parts constitute 2 series, ie 2 in part 0 or 1+1 in parts 0 and 1.
+)
+
+val ExternalData = tuple(
+    cube: Cubedef,
+    contexts: list(Kvpair),
+    implicit:boolean,
+    accessor: string
+)
+
+// Users can assemble HomemadeDimensions as a sequence of perfspec versions with identifier & descrn that explains
+// what the sequence compares. This permits to extend by 1 the number of dimensions of a chart part, and thereby compare and
+// hopefully understand whatever measurement aspect the sequence represents. Note that the description
+// can sometimes be derived from strings in the context of its constituent elements if those are managed correctly.
+val HomemadeDimension = tuple(
+    ident: string,		// name of this hmdim
+    description: string,
+    elements: list(integer)         // these are version #'s
+)
+
+val Frontend = tuple(
+    externals: list(ExternalData),
+    hmdims: list(HomemadeDimension),
+    savedCharts: list(ChartDesc),
+    preferredVersion: integer       // initially 0 but can be set by user
+)
+
+val getWorkingDirName = \(basename: string) { "wd.#{basename}/" }
+
+val param2paramT = \(prm: Parameter) { [dtbl.paramT: prm.ident, prm.explanation, "", prm.elements, true, true] }
+
+import "webgen/charthelp" melted
+
+
+val stateAttribs = tuple(
+    dirname:string,                 // the directory we get our perfspecs from
+    pfsOptions: list(PfsData),      // we store full meta data on each perfspec we know about
+    activePS: PfsData,              // info about the selected perfspec
+    frontendInfo: Frontend,         // same
+    dscheme: dtbl.datascheme,
+    xtrnlAccessor: string,          // This is the original source, not the extracted version stored locally
+    xtrnlData: dtbl.rowcolT,
+    baseParams: list(dtbl.paramT),
+    jstrmOut: xJsonT,
+    activeHMI: integer              // -1 if inactive
+)
+
+val runstateT = extend stateAttribs where {
+    method lithook = \mod(dirnm: string) {
+        dirname = dirnm
+        pfsOptions = []
+        activeHMI = -1
+    }
+
+    private method versionName = \(vnum: integer) {
+        "V#{vnum}"
+    }
+
+    // Document how to find the perfspec name, which is quite well hidden
+    private method perfspecName = \() { activePS.cube.ident }
+
+    private method genFilenames = \imp(versions: list(integer)) {
+        val letters = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s"]
+        var names:list(string) = []
+        var nameStrmr = [strms.streamIndices: activePS.substns.{ elements.count }]
+        if(nameStrmr.done) {
+            each(vnum^versions) names.pushb("#{vnum}/LMa.csv")
+        } else while(!nameStrmr.done) {
+            val tmp = nameStrmr.next        // get next list of indices for each substn
+            val ltr0 = strings.join(tmp.{ letters[this] }, ``)
+            each(vnum^versions) names.pushb("#{vnum}/LM#{ltr0}.csv")
+        }
+        names
+    }
+    assert noInline(genFilenames)
+
+    // Given an index in the allDims of the active perfspec, access the right slot to get the elts
+    // Return the elements of allDimsIndices at index.
+    // This will be called on enumerated indices of allDimsIndices; this can be as abscissa, multiseries, or clickable.
+    method pfsIndex2Elts = \(index: integer) {
+        val pfs = activePS
+        val nParams = pfs.cube.params.count, nSubstns = pfs.substns.count
+        if(index < nParams) pfs.cube.params[index].elements
+        else if(index < nParams + nSubstns) pfs.substns[index - nParams].elements
+        else frontendInfo.hmdims[index - (nParams + nSubstns)].elements.{ versionName(this) }
+    }
+
+    method pfsIndex2Ident = \(index: integer) {
+        val pfs = activePS
+        val nParams = pfs.cube.params.count, nSubstns = pfs.substns.count
+        if(index < nParams) pfs.cube.params[index].ident
+        else if(index < nParams + nSubstns) pfs.substns[index - nParams].ident
+        else frontendInfo.hmdims[index - (nParams + nSubstns)].ident
+    }
+
+    // Call this after extractChartData to write attributes that don't depend intimately on the shape of the chart data
+    // It closes the entire object -- what it writes is unbalanced in that sense.
+    method wrapChartData = \mod(cdesc0: ChartDesc) {
+        val adi = cdesc0.parts[0].allDimsIndices
+        var clickInx = adi.index(-2)
+        val clickElts:list(string) = clickInx == nil ? [] : pfsIndex2Elts(clickInx)
+        var multiInx = adi.index(-3)
+        val multiElts:list(string) = multiInx == nil ? [] : pfsIndex2Elts(multiInx)
+        jstrmOut.add(",\"multiElts\":")
+        jstrmOut.toJsonListString(multiElts)
+        jstrmOut.add(",\"clickElts\":")
+        jstrmOut.toJsonListString(clickElts)
+        var abscissaString = "outputs"
+        unless(cdesc0.outsAsAbscissa) {
+            val abscissaIndex = always(x~adi.index(-1), x!=nil)
+            abscissaString = pfsIndex2Ident(abscissaIndex)
+        }
+        jstrmOut.add(",\"abscissaDesc\":")
+        jstrmOut.toJsonString(abscissaString)
+        jstrmOut.add("}}")
+    }
+}
+
+var flagVerbose = flag.Bool("v", false, "verbose mode (print info per test)")
+
+
+// Here's the (relevant) PfsData for setolist transcribed into d8m. 3 params, 4 outputs, 0 substns.
+val pfsdSetolist = [PfsData:
+    [Cubedef: "setolist", "...descrn of setolist...",
+       // params
+     [["setSize", "...explanation...", "", ["10000","50000","100000"]],
+      ["otherSize", "...explanation...", "", ["50","5000"]],
+      ["yesprob", "...explanation...", "percent", ["5","40", "80"]]],
+      // outputs
+     [["avg time", "...explanation...", "microsecond"],
+      ["min time", "...explanation...", "microsecond"],
+      ["max time", "...explanation...", "microsecond"],
+      ["yesFract", "...explanation...", "percent"]]],
+    [], [], 0]
+
+val pfsdLinbin = [PfsData:
+    [Cubedef: "lin+bin", "...descrn of lin+bin...",
+     [["listSize", "...explanation...", "", ["100","400","1000","2000"]]],
+     [["lookupTime", "...explanation...", "nanosecond"]]],
+    // substn
+    [["LT_ET", "...descrn of substn...", "", ["list(integer)","list(tuptype)","olist0(integer)","olist(tuptype...)"]]],
+    [], 0
+]
+
+val pfsdSetAR = [PfsData:
+    [Cubedef: "setAddRmv", "...descrn of setAddRmv...",
+     [["targetSize", "", "", ["1024","2048","4096","8192","16384","32768","65536","131072"]]],
+     [["setsize","",""],["inCount","",""], ["checktime","","nanosecond"], ["t(remove1)","","nanosecond"], ["addtime","","nanosecond"], ["t(remove2)","","nanosecond"]]],
+    // substn
+    [["SET", "", "", ["as map","as olist","as splay tree"]]],
+    [], 0
+]
+
+val pfsdZCS = [PfsData:
+    [Cubedef: "zipcsvsort", "...descrn of setAddRmv...",
+     [],
+     [["zip","",""],["csv","",""], ["totals","",""], ["sort1","",""], ["sort2","",""]]],
+    [],
+    [], 0
+]
+
+val emptyFrontend = [Frontend: [], [], [], 0]
+val setARX0 = [ExternalData:
+    [Cubedef: "python integer sort", "...descrn...",
+     [["List Size", "...explanation...", "", ["1000","2000","4000","8000","12000","16000","20000","25000","32000","40000","50000","60000","80000","100000"]]],
+     [["sort time", "...explanation...", "nanosecond"]]],
+    [], false, ""
+]
+val setARFrontend = [Frontend: [setARX0], [["random diffs", "", [0,1,2]]], [], 0]
+// Here, input is for part 0; part1 is [] for omitted else one int each for [dataset, param, output] indices
+// The cws slot is [] for inactive else first elt is the compareOption which should be 1-4, then 0 or 2 more for what xcd wants.
+val TestDataItem = extend tuple(pfsi: PfsData, input: tuple(fe:Frontend, adi, outs, cws: list(integer)), part1:list(integer), oaa:boolean, hmdinx:integer, output: string) where {
+    method expectADI = \() { pfsi.cube.params.count + pfsi.substns.count }
+}
+
+// Note: need to add 1+ items with oaa set to true
+
+val testData: list(TestDataItem) = [
+    // single output, no complications
+    [pfsdSetolist,
+     [fe~emptyFrontend, adi~[-1, 0, 0], outs~[1], cws~[]], [], false, 0,
+     `{"series":[{"x":10000,"y0":42},{"x":50000,"y0":83},{"x":100000,"y0":125}],"multiElts":[],"clickElts":[],"abscissaDesc":"setSize"}}`],
+    // enum second param (2x) and 2 outputs; 4 datasets total
+    [pfsdSetolist,
+     [fe~emptyFrontend, adi~[-1, -2, 0], outs~[0, 1], cws~[]], [], false, 0,
+     `{"series":[{"x":10000,"y0":1465,"y1":42,"y2":9012,"y3":959},{"x":50000,"y0":9560,"y1":83,"y2":18746,"y3":1375},{"x":100000,"y0":14337,"y1":125,"y2":26700,"y3":708}],"multiElts":[],"clickElts":["50","5000"],"abscissaDesc":"setSize"}}`],
+      // next one crashes, think it's a bug in dataTable.
+/*    [pfsdSetolist,
+     [fe~emptyFrontend, adi~[-1, 1, 1], outs~[0, 1], cws~[1,0,1]], [], false, 0,
+     `{"series":[{"x":10000,"y0":1465,"y1":42,"y2":9012,"y3":959},{"x":50000,"y0":9560,"y1":83,"y2":18746,"y3":1375},{"x":100000,"y0":14337,"y1":125,"y2":26700,"y3":708}],"multiElts":[],"clickElts":["50","5000"],"abscissaDesc":"setSize"}}`],
+*/
+    // new perfspec, 2 enums and 1 output
+    [pfsdLinbin,
+     [fe~emptyFrontend, adi~[-1, -2], outs~[0], cws~[]], [], false, 0,
+     `{"series":[{"x":100,"y0":51,"y1":52,"y2":47,"y3":80},{"x":400,"y0":179,"y1":183,"y2":61,"y3":137},{"x":1000,"y0":400,"y1":414,"y2":70,"y3":137},{"x":2000,"y0":768,"y1":795,"y2":72,"y3":132}],"multiElts":[],"clickElts":["list(integer)","list(tuptype)","olist0(integer)","olist(tuptype...)"],"abscissaDesc":"listSize"}}`],
+    // 1 enum and 1 output
+    [pfsdLinbin,
+     [fe~emptyFrontend, adi~[-1, 0], outs~[0], cws~[]], [], false, 0,
+     `{"series":[{"x":100,"y0":51},{"x":400,"y0":179},{"x":1000,"y0":400},{"x":2000,"y0":768}],"multiElts":[],"clickElts":[],"abscissaDesc":"listSize"}}`],
+    // new perfspec, 2 enums and 1 output
+    [pfsdSetAR,
+     [fe~setARFrontend, adi~[-1, -2], outs~[2], cws~[]], [], false, 0,
+     `{"series":[{"x":1024,"y0":19,"y1":72,"y2":63},{"x":2048,"y0":17,"y1":76,"y2":66},{"x":4096,"y0":18,"y1":82,"y2":72},{"x":8192,"y0":20,"y1":89,"y2":83},{"x":16384,"y0":20,"y1":88,"y2":98},{"x":32768,"y0":21,"y1":82,"y2":105},{"x":65536,"y0":22,"y1":92,"y2":107},{"x":131072,"y0":22,"y1":99,"y2":171}],"multiElts":[],"clickElts":["as map","as olist","as splay tree"],"abscissaDesc":"targetSize"}}`],
+    // now 2nd enum is hmdim 0 and 1 output
+    [pfsdSetAR,
+     [fe~setARFrontend, adi~[-1, 1, -3], outs~[2], cws~[]], [], false, 0,
+     `{"series":[{"x":1024,"y0":72,"y1":57,"y2":74},{"x":2048,"y0":76,"y1":62,"y2":76},{"x":4096,"y0":82,"y1":67,"y2":76},{"x":8192,"y0":89,"y1":76,"y2":88},{"x":16384,"y0":88,"y1":78,"y2":80},{"x":32768,"y0":82,"y1":82,"y2":83},{"x":65536,"y0":92,"y1":91,"y2":90},{"x":131072,"y0":99,"y1":101,"y2":103}],"multiElts":["V0","V1","V2"],"clickElts":[],"abscissaDesc":"targetSize"}}`],
+    // add an external to the previous chart
+    [pfsdSetAR,
+     [fe~setARFrontend, adi~[-1, 1, -3], outs~[2], cws~[]], [0,0,0], false, 0,        // external 0, abscissa 0, output 0
+     `{"series":[{"x":1024,"y0":72,"y1":57,"y2":74},{"x":2048,"y0":76,"y1":62,"y2":76},{"x":4096,"y0":82,"y1":67,"y2":76},{"x":8192,"y0":89,"y1":76,"y2":88},{"x":16384,"y0":88,"y1":78,"y2":80},{"x":32768,"y0":82,"y1":82,"y2":83},{"x":65536,"y0":92,"y1":91,"y2":90},{"x":131072,"y0":99,"y1":101,"y2":103},{"x":1000,"ya0":45532},{"x":2000,"ya0":120682},{"x":4000,"ya0":299807},{"x":8000,"ya0":673823},{"x":12000,"ya0":1067959},{"x":16000,"ya0":1488468},{"x":20000,"ya0":1880580},{"x":25000,"ya0":2427437},{"x":32000,"ya0":3234143},{"x":40000,"ya0":4067273},{"x":50000,"ya0":5231856},{"x":60000,"ya0":6465009},{"x":80000,"ya0":8779346},{"x":100000,"ya0":11273358}],"multiElts":["V0","V1","V2"],"clickElts":[],"abscissaDesc":"targetSize"}}`],
+    // back to no hmdim; 2 outputs
+    [pfsdSetAR,
+     [fe~setARFrontend, adi~[-1, 1], outs~[3,4], cws~[]], [], false, 0,
+     `{"series":[{"x":1024,"y0":91,"y1":140},{"x":2048,"y0":110,"y1":191},{"x":4096,"y0":151,"y1":310},{"x":8192,"y0":244,"y1":519},{"x":16384,"y0":377,"y1":888},{"x":32768,"y0":698,"y1":1796},{"x":65536,"y0":1503,"y1":3873},{"x":131072,"y0":3055,"y1":7834}],"multiElts":[],"clickElts":[],"abscissaDesc":"targetSize"}}`],
+    // same as previous but with comparison
+    [pfsdSetAR,
+     [fe~setARFrontend, adi~[-1, 1], outs~[3,4], cws~[1]], [], false, 0,
+     `{"series":[{"x":1024,"compare":"65%","y0":91,"y1":140},{"x":2048,"compare":"58%","y0":110,"y1":191},{"x":4096,"compare":"49%","y0":151,"y1":310},{"x":8192,"compare":"47%","y0":244,"y1":519},{"x":16384,"compare":"42%","y0":377,"y1":888},{"x":32768,"compare":"39%","y0":698,"y1":1796},{"x":65536,"compare":"39%","y0":1503,"y1":3873},{"x":131072,"compare":"39%","y0":3055,"y1":7834}],"multiElts":[],"clickElts":[],"abscissaDesc":"targetSize"}}`],
+    [pfsdZCS,
+     [fe~emptyFrontend, adi~[], outs~[0,1,2,3,4], cws~[]], [], true, 0,
+     `{"series":[{"x":"zip","y0":55},{"x":"csv","y0":610},{"x":"totals","y0":610},{"x":"sort1","y0":619},{"x":"sort2","y0":626}],"multiElts":[],"clickElts":[],"abscissaDesc":"outputs"}}`],
+]
+
+
+val runTest = \imp() {
+    val hmd2paramT = \(hmd: HomemadeDimension) { [dtbl.paramT: hmd.ident, hmd.description, "", hmd.elements.{stringify(this)}, true, true] }
+    flag.Parse()
+    var progstate = [runstateT: "../perfspecs"]
+    var good = 0
+    each(run^testData, runinx) {
+        if(flagVerbose) {
+            println("run", runinx)
+        }
+        progstate.activePS = run.pfsi
+        progstate.frontendInfo = run.input.fe
+        val filefmt = [dtbl.fileFormat: run.pfsi.cube.params.{ param2paramT(this) }, run.pfsi.cube.outputs.{ ident }]
+        progstate.dscheme = [dtbl.datascheme: filefmt, dtbl.stdFileGetter]
+        var namesArg = [progstate.frontendInfo.preferredVersion]
+        var xtparams = run.pfsi.substns.{ param2paramT(this) }
+        if(run.expectADI != run.input.adi.count) {
+            val hmd = progstate.frontendInfo.hmdims[run.hmdinx]
+            xtparams.pushb(hmd2paramT(hmd))
+            namesArg = hmd.elements
+            // println("namesarg", namesArg)
+        }
+        val fnames = progstate.genFilenames(namesArg)
+        if(flagVerbose) {
+            println("setting dscheme with", xtparams, "; fnames=", fnames)
+        }
+        progstate.dscheme.update(xtparams, fnames, getWorkingDirName(run.pfsi.cube.ident))
+
+        // set up the ChartDesc
+        var cws:list(integer), cmpOpt = 0
+        if(run.input.cws.count != 0) {
+            cws = run.input.cws.tail
+            cmpOpt = run.input.cws[0]
+        }
+        val cpart0 = [ChartPart: "", run.input.adi, run.input.outs, cws, [Visual: "", 0, 0]]
+        var cdesc0 = [ChartDesc: "chart title", "chartident", [cpart0], "ch unit", 0, run.oaa, true, false, "0", "0", cmpOpt]
+        if(run.part1.count > 0) {
+            val xdata = progstate.frontendInfo.externals[run.part1[0]]
+            // note: this setup assumes 1 param used as abscissa
+            val cpart1 = [ChartPart: xdata.cube.ident, [-1], [run.part1[2]], [], [Visual: "", 0, 0]]
+            cdesc0.parts.pushb(cpart1)
+        }
+
+        // call xcd and get its result.
+        var xvalues:list(string)
+        if(run.oaa) {
+            xvalues = run.pfsi.cube.outputs.{ ident }
+        } else {
+            val abscissaIndex = always(x~run.input.adi.index(-1), x!=nil)
+            xvalues = progstate.pfsIndex2Elts(abscissaIndex)
+        }
+        progstate.jstrmOut = [xJsonT: [list(byte): ]]
+        progstate.jstrmOut.extractChartData(cdesc0, progstate.activePS, progstate.dscheme, progstate.frontendInfo, xvalues, ".")
+        val errmsgs = progstate.jstrmOut.errors()
+        if(errmsgs != "") println("error:", errmsgs)
+        else {
+            progstate.wrapChartData(cdesc0)
+            val xcdout = progstate.jstrmOut.out()
+            if(xcdout != run.output) println("on #{runinx}, expected:", run.output, "\nbut got:", xcdout)
+            else good += 1
+        }
+    }
+    if(good == testData.count) println("#{testData.count} tests: all good")
+    else println("#{good} of #{testData.count} tests were ok")
+}
+

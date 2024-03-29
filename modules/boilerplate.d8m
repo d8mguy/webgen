@@ -1,0 +1,94 @@
+
+// organize (and isolate) the fixed text going into client and server output
+// Note: there are multiline string literals below enclosed in ``. It's important not to put `` in them.
+// Very confusing error messages if you do!
+
+export client, server
+val clientT = tuple(imports, setup, css: string)
+val serverT = tuple(imports, setup: string)
+
+val client = [clientT:
+// client imports
+`
+import './App.css';
+import axios from 'axios';
+`,
+// client setup
+`
+
+function ErrorPopup(props) {
+  return (
+      props.msg === "" ? "" :
+        <div className="ErrorPopup">{props.msg}
+          <button onClick={e => props.clearMsg()}>OK</button>
+      </div>
+  )
+}
+
+function App(props) {
+`,
+// global fixed definitions for App.css
+`
+.ErrorPopup {
+    z-index: 5;
+    display: flex;
+    flex-direction: column;
+    position: absolute;
+    left: 50px;
+    top: 50px;
+    background: cornsilk;
+    margin: auto;
+    justify-content: space-around;
+    align-items: center;
+    border: 2px solid red;
+    width: 400px;
+    height: 200px;
+}
+* {
+    box-sizing: border-box;
+    font-size: 11pt;
+}
+
+textarea {
+    font-size: inherit;
+}
+`]
+
+val server = [serverT:
+`import "codecs/json"
+import go "net/http"
+`,
+// server setup
+`
+//  Call errorResponse to get a json-encoded error actionfnRettyep
+// They ensure that the response sent to the client indicates the server side error if there is one. ErrorResponse
+// is for the times when there is one, and goodResponse when there isn't.
+
+
+val actionfnRettype = extend tuple(err: string, respinx: integer, response: string) where {
+    val errorResponse = \imp(errmsg: string) -> string {
+        val jsonbuff:list(byte) = zerolist(25 + errmsg.count)
+        var jstrm = [json.jsonStreamer: jsonbuff]
+        jstrm.toJsonStartObject(); jstrm.toJsonAttributeOpen(:error); jstrm.toJsonString(errmsg)
+        jstrm.add(",\"respinx\":0,\"ok\":null}")
+        jstrm.out
+    }
+
+    val goodResponse = \imp(jsonString: string, respinx: integer) -> string {
+        val goodString = jsonString == "" ? "\"\"" : jsonString
+        val jsonbuff:list(byte) = zerolist(15 + goodString.count)
+        var jstrm = [json.jsonStreamer: jsonbuff]
+        jstrm.add("{\"error\":\"\",\"respinx\":")
+        jstrm.add(stringify(respinx))
+        jstrm.add(",\"ok\":")
+        jstrm.add(goodString)
+        jstrm.add("}")
+        jstrm.out
+    }
+    method encode = \() {
+        err == "" ? goodResponse(response, respinx) : errorResponse(err)
+    }
+}
+
+`
+]

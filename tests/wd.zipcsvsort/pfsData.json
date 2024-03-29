@@ -1,0 +1,30 @@
+{
+  "cube":{
+    "ident":"zipcsvsort",
+    "description":" # Small App Benchmark  This perfspec reads a zipped archive containing a single csv file with ~162K rows,  extracts and reads selected columns of the csv file, then do some calculations, detailed below, that involve sorting another other operations. The cvs file is from the 2010 US census, and starts with a header row; the first 3 rows are     name,rank,count,prop100k,cum_prop100k,pctwhite,pctblack,pctapi,pctaian,pct2prace,pcthispanic     SMITH,1,2442977,828.19,828.19,70.9,23.11,0.5,0.89,2.19,2.4     JOHNSON,2,1932812,655.24,1483.42,58.97,34.63,0.54,0.94,2.56,2.36 It's a file of last names and counts; the last 6 cols are fractions by race. So whereas 71% of Smiths are white, only 59% of Johnsons are. The tasks are (1) names and total count of whitest names that constitute 30% of whites; (2) names and total count of names that constitute 60% of hispanic. I'm going to assume we need to extract the #'s of whites and hispanics from the data. So the steps are (1) calc total # of whites and hispanics; (2) sort on pctwhite then count and grab until you hit 30%; (3) same for hispanic. The perfspec has no parameters; the outputs form a timeseries and identify the steps along the way.",
+    "params":[],
+    "outputs":[
+      {
+        "ident":"zip",
+        "explanation":"time to extract zip file",
+        "unit":""},
+      {
+        "ident":"csv",
+        "explanation":"time to read csv file",
+        "unit":""},
+      {
+        "ident":"totals",
+        "explanation":"time to calc totals",
+        "unit":""},
+      {
+        "ident":"sort1",
+        "explanation":"time to sort on white and calc top 30%",
+        "unit":""},
+      {
+        "ident":"sort2",
+        "explanation":"time to sort on hispanic and calc top 30%",
+        "unit":""}
+      ]},
+  "substns":[],
+  "contexts":[],
+  "version":-1}

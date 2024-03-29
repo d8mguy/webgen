@@ -1,0 +1,37 @@
+// Manage a cache of html files derived via pandoc from md files.
+
+export get
+
+import "file"
+import go "os/exec"
+
+// Read a file named basefn.html and return its contents. Also check for basefn.md. If either (1) basefn.html doesn't
+// exist or (2) it exists but mod date of basefn.md is more recent, then run pandoc -r gfm on basefn.md and write basefn.html,
+// before returning its contents.
+val get = \imp(basefnm, dirnm:string) -> string {
+    val fnmH = dirnm + "/#{basefnm}.html"
+    val fnmM = dirnm + "/#{basefnm}.md"
+    val mfdesc = file.openWithError(fnmM)
+    val hfdesc = file.openWithError(fnmH)
+    if(tag(mfdesc) == :err) exit(mfdesc)
+    if(tag(hfdesc) == :ok) {
+        if(mfdesc.modtime().Before(hfdesc.modtime())) {
+            var bytes:list(byte) = zerolist(hfdesc.size())
+            hfdesc.read(bytes)
+            //println("using cache on", basefnm)
+            mfdesc.close()
+            hfdesc.close()
+            return cvt(bytes, string)
+        }
+        hfdesc.close()
+    }
+    mfdesc.close()
+    val pdout = exec.Command("pandoc", ["-r", "gfm", fnmM]).Output()
+    if(pdout.err != nil) exit(pdout.err)
+    //println("gen html on", basefnm)
+    var hfd = file.createWithError(fnmH)
+    if(tag(hfd) == :err) exit(hfd)
+    hfd.write(pdout.out)
+    hfd.close()
+    cvt(pdout.out, string)
+}

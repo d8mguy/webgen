@@ -1,0 +1,200 @@
+// Module charthelp exists to decouple the d8m code that interprets a ChartDesc in the context of an active perfspec dataset
+// to get and json encode a ChartData. Part of the complexity here is that the ChartData cannot be represented in d8m's
+// type system. Because it includes a list(tuple) where the tuple type depends on the value of the ChartDesc. This is what
+// recharts.js wants. So extractChartData joins together the extraction with the json encoding. The solution here is
+
+export xJsonT
+
+import "dataTable" as dtbl
+import "perfsis/types" melted
+import "matrix" as mtx
+import "num/lininterp"
+
+// Function numeric uses numpattern to figure out how to format outgoing data in "x" -- as strings for categorical, else as numbers.
+val numpattern = [regexp.regexpT: `^-?\d+(\.\d+)?((e|E)-?\d+)?$`]
+val numeric = \(s:string) { numpattern.find(s) != [] }
+
+// This and the next function define stringify policies for ratios and diffs respectively.
+val ratioString = \(ratio: float) {
+    if(ratio <= 0) ""
+    else if(ratio <= 1e-3 || ratio >= 1e3) fmt.Sprintf("4.ex", ratio)
+    else if(ratio <= 1e-2) fmt.Sprintf("0.%d%%", round(ratio*1000))
+    else if(ratio <= 1.0) fmt.Sprintf("%d%%", round(ratio*100))
+    else if(ratio <= 10.0) fmt.Sprintf("%4.1fx", ratio)
+    else fmt.Sprintf("%dx", round(ratio))
+}
+
+val diffString = \(diff:float) {
+    (diff >= 0.0 ? "+" : "-") + to_s(diff, 2)
+}
+
+// Given lists lst0, lst1, and cmprOpt in 1..4, compare according to cmprOpt and generate strings from ratio or diff methods.
+// This is for pairs of y values aligned to same x values, so lst0.count == lst1.count.
+val genCompareAligned = \(lst0, lst1: list(float), cmprOpt:integer) -> list(string) {
+    [a~lst0, b~lst1].xp.{
+        if(cmprOpt == 1) ratioString(a/b)
+        else if(cmprOpt == 2) diffString(a - b)
+        else if(cmprOpt == 3) ratioString(b/a)
+        else diffString(b - a)
+    }
+}
+
+// This function has the same output as genCompareAligned but is for pairs of y values having diff x values.
+// We use linear interpolation to infer ratios or diffs of y1 values at all the values of x0. IOW the retval only
+// applies to range(x0), it has x0.count elements.
+val genCompareInterpolated = \imp(x0, x1, y0, y1: list(float), cmprOpt:integer) -> list(string) {
+    var fsm = [lininterp.interpFSM: cmprOpt < 3 ? x1 : x0, cmprOpt < 3 ? y1 : y0]
+    case {
+        cmprOpt == 1 => [x~x0, y~y0].xp.{ ratioString(fsm.exists(x) ? y/fsm.next(x) : 0.0) }
+        cmprOpt == 2 => [x~x0, y~y0].xp.{ fsm.exists(x) ? diffString(y - fsm.next(x)) : "" }
+        cmprOpt == 3 => [x~x1, y~y1].xp.{ ratioString(fsm.exists(x) ? y/fsm.next(x) : 0.0) }
+        cmprOpt == 4 => [x~x1, y~y1].xp.{ fsm.exists(x) ? diffString(y - fsm.next(x)) : "" }
+    }
+}
+
+// Helper for xJsonT.extractChartData. It's global because something in it confuses my editor about folding if defined more locally.
+//
+// Here "row" means encode a single abscissa point for the data array that recharts wants, with the external data
+// when present and "aligned" (which we require for categorical data). Arg yx adds a ya0 value when base & external are categorical.
+// Arg compare is the string to put in compare position if this series is subject to comparison.
+val makeRow = \imp(xvalue, compare: string, yvalues: list(string), yx:string) {
+    val xval0 = numeric(xvalue) ? xvalue : `"` + xvalue + `"`
+    var pfx = [`{"x":` + xval0]
+    if(compare != "") pfx.pushb("\"compare\":\"#{compare}\"")
+    if(yx != "") pfx.pushb("\"ya0\":\"#{yx}\"")
+    strings.join(pfx + yvalues.{ "\"y#{index}\":" + this }, ",") + "}"
+}
+
+// Here, we extend jsonStreamer to handle extractChartData. Note that webgen includes json module so we can assume it's available.
+// So the protocol for generating chart data is to create a xJsonT, put some initial stuff in it, call its extractChartData method,
+// then add other attributes and close the json object. ExtractChartData writes the properties named series and outputElts.
+val xJsonT = extend json.jsonStreamer where {
+    // receive the streamer in some state and add chart data. Set error if anything goes wrong.
+    method extractChartData = \mod(cdesc0: ChartDesc, activePS:PfsData, dscheme:dtbl.datascheme, fei:Frontend, xvalues0:list(string), dir:string) -> nothing {
+        val cpart0 = cdesc0.parts[0]
+        var outStrings: list(list(string)) = [cpart0.outputs.{ activePS.cube.outputs[this].ident }]
+        //println("outStrings:", outStrings[0], cpart0)
+        // copy indices so we can swap in multiInx if clickInx isn't used.
+        var dtblIndices = copy(cpart0.allDimsIndices)
+        var clickInx = dtblIndices.index(-2)
+        var multiInx = dtblIndices.index(-3)
+        // if enum'g multi but not click, use -2 as the index so they're contiguous
+        if(clickInx == nil && multiInx != nil) {
+            clickInx = multiInx
+            assert clickInx != nil
+            multiInx = nil
+            dtblIndices[clickInx] = -2
+        }
+
+        val cube0 = activePS.cube
+
+        // caller should set up dscheme compatible with ADI; verify this before extracting data
+        val wantCount = dtblIndices.count - cube0.params.count      // dscheme has just extra params (substns & hmdims)
+        val xpcount = dscheme.xparamsCount                       // this is what's in dscheme
+        if(wantCount != xpcount) {
+            error("hmdims set up wrong, want #{xpcount}; got #{wantCount}")
+            return
+        }
+        // Note that dscheme.extract returns a list(list(string))
+        val colthresh = min(1, cube0.params.count)
+        //println("dtblIndices, outs, thresh:", dtblIndices, cpart0.outputs, colthresh)
+        var extractedBase = dscheme.extract(dtblIndices, cpart0.outputs, colthresh)
+        //println("xcd got", extractedBase)
+        var xvalues: list(string)
+        var baseCategorical = false     // indicate if the base abscissa is categorical (else numeric)
+
+        // Note: outsAsAbscissa is, in hypercube perspective, a column encoded param; for perf msmt this typically means a timeseries.
+        // Since its occurrence is very restricted, we give it special treatment instead of a more abstract one.
+        if(cdesc0.outsAsAbscissa) {
+            val zzz = mtx.transpose(extractedBase)
+            extractedBase = cast(zzz, dtbl.rowcolT)
+            xvalues = outStrings[0]
+            baseCategorical = true
+        } else {
+            val abscissaIndex = always(x~cpart0.allDimsIndices.index(-1), x!=nil)
+            xvalues = xvalues0
+            baseCategorical = abscissaIndex >= cube0.params.count
+        }
+        //println("xvalues:", xvalues)
+        // we need to read and save externals in case we're comparing one with a base dataseries
+        var extractedExternals: list(dtbl.rowcolT) = []
+        var extractedXvals: list(list(string)) = []
+        var externalIsCategorical = false
+        if(cdesc0.parts.count > 1) {
+            val nxpart = cdesc0.parts[1]      // get external spec
+            val externId = nxpart.source
+            //println("getting external", externId)
+            val externl = fei.externals[this.cube.ident == externId]
+            if(externl == nil) { error("can't find external named '#{externId}'"); return }
+            val filefmt = [dtbl.fileFormat: externl.cube.params.{ param2paramT(this) }, externl.cube.outputs.{ ident }]
+            if(externl.cube.params.count > 0) {
+                // normal case, with params (else outputs only)
+                val xvals0Index = always(x~nxpart.allDimsIndices.index(-1), x!=nil)
+                extractedXvals.pushb(externl.cube.params[xvals0Index].elements)
+            }
+            outStrings.pushb(nxpart.outputs.{ externl.cube.outputs[this].ident })
+            var dschemeX = [dtbl.datascheme: filefmt, dtbl.stdFileGetter]
+            dschemeX.update([], ["/externals/#{externId}.csv"], dir + "/wd." + cube0.ident)
+            val colthresh = min(1, externl.cube.params.count)
+            var extractedPart = dschemeX.extract(nxpart.allDimsIndices, nxpart.outputs, colthresh)
+            if(externl.cube.params.count == 0) {
+                val zzz = mtx.transpose(extractedPart)
+                extractedPart = cast(zzz, dtbl.rowcolT)
+                xvalues = always(x~outStrings.last, x!=nil)
+                extractedXvals.pushb(xvalues)
+                externalIsCategorical = true
+            }
+            extractedExternals.pushb(extractedPart)
+        } else if(cpart0.compareWithSubstn != [] && cdesc0.compareOptions > 0) {
+            // Possibly need to add data from another substn, but only if no externals
+            // Note: we can mod dtblIndices for this, we're done with it
+            each(substnElt^cpart0.compareWithSubstn, cwsinx) dtblIndices[cube0.params.count + cwsinx] = substnElt
+            var xbase2 = dscheme.extract(dtblIndices, cpart0.outputs, colthresh)
+            // println("cws will add", xbase2, "; dtblIndices, outs, thresh:", dtblIndices, cpart0.outputs, colthresh)
+            //each(xbe^extractedBase, inx) xbe.pushb(xbase2[inx][0])
+            extractedBase = cast(extractedBase.{ this + xbase2[index] }, dtbl.rowcolT)
+            each(cws^cpart0.compareWithSubstn, index) outStrings[0].pushb(activePS.substns[index].elements[cws])
+            // println("xbase now: ", extractedBase)
+        }
+
+        // Now we have all data ready to hand (though not converted to numeric). If comparison is indicated, do the work and prep to encode that.
+        var compareStrings: list(string) = []   // will be length of xvalues if comparison is enabled
+        val cmprOpts = cdesc0.compareOptions
+        if(cmprOpts > 0) {         // consider adding comparison labels
+            if(cdesc0.parts.count == 1) {       // here, the 2 items are in part 0, else there's one in each of 2 parts
+                if(numeric(extractedBase[0][0]) && numeric(extractedBase[0][1])) {
+                    compareStrings = genCompareAligned(extractedBase.{ this[0].to_f }, extractedBase.{ this[1].to_f }, cmprOpts)
+                } else println("warning: attemmpted to compare non-numeric dataseries")
+            } else if(numeric(extractedBase[0][0]) && numeric(extractedExternals[0][0][0])) {
+                // 1 dataseries in base, the other in external, requires interpolation, hence need x values
+                val x0 = xvalues.{ this.to_f }
+                val x1 = extractedXvals[0].{ this.to_f }
+                val y0 = extractedBase.{ this[0].to_f }
+                val y1 = extractedExternals[0].{ this[0].to_f }
+                compareStrings = genCompareInterpolated(x0, x1, y0, y1, cmprOpts)
+            } else println("warning: attemmpted to compare non-numeric dataseries")
+        }
+
+        // Here, fmtd is a dotbrace of calls to makeRow but complex enough to break down into each.
+        var fmtd: list(string) = []
+        each(xv^xvalues, index) {
+            val xtra = externalIsCategorical ? "#{extractedExternals[0][index][0]}" : ""
+            fmtd.pushb(makeRow(xv, cmprOpts > 0 ? compareStrings[index] : "", extractedBase[index], xtra))
+        }
+        //println("after base, fmtd=", fmtd)
+        // Add rows (created "manually") for non-categorical externals, since these get separate objects in the array for recharts.
+        if(cdesc0.parts.count > 1 && !externalIsCategorical) {
+            each(xx^extractedExternals[0], index) {
+                var nxobj = "{\"x\":#{extractedXvals[0][index]},\"ya0\":#{xx[0]}"
+                if(cmprOpts >= 3) nxobj += `,"compare":"` + compareStrings[index] + `"`
+                fmtd += nxobj + "}"
+            }
+        }
+        // Now add the chart data to self; the opening brace and the name+colon should already be there
+        self.add("{\"series\":[");
+        self.add(strings.join(fmtd, ","))
+        self.add("]")
+        //println("xcd returns: ", self.out())
+
+    }
+}

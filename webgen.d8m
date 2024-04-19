@@ -940,8 +940,10 @@ val driver = \imp() {
     flag.Parse()
     val args = flag.Args()
     if(args.count != 1) exit("missing filename argument: expecting 'webgen {-client=path specfile.d8m'")
-    unless(file.quickCheck(clientDir) == 1) exit("#{clientDir} must be a directory")
-    println("target is", clientDir)
+    unless(deploy) {
+        unless(file.quickCheck(clientDir) == 1) exit("#{clientDir} must be a directory")
+        println("target is", clientDir)
+    }
     // get fname and split it into path and filename proper
     var fname = args[0]
     val arglen = fname.count

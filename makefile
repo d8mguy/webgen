@@ -12,4 +12,5 @@ install: webgen
 	mv webgen $(execdir)
 	mkdir -p ${HOME}/Library/Application\ Support/D8m/Webgen
 	cp -p -r components ${HOME}/Library/Application\ Support/D8m/Webgen/
+	cp -p -r modules ${HOME}/Library/Application\ Support/D8m/Webgen/
 	d8mc -addmod="webgen,$(mdir)"

@@ -447,7 +447,7 @@ There's some flexibility in the order you define various parts of a webgen spec,
 The webgen program has one argument &mdash; the specification file, and several optional flags:
 - `-client=path` defaults to `src`; defines the target directory for client files (including `App.js` and `App.css`). 
 - `-port=number` defaults to `8080`; the server uses this localhost port
-- `-deploy` defaults to `false`; see below
+- `-deploy` defaults to the empty string; see below
 
 The expectation is that you use `create-react-app` for the develop/debug phase of your interactive app. If you put the specification file in the top level of the directory tree for this environment, the default value of the `client` flag is what you want. For example
 
@@ -471,10 +471,10 @@ When you are ready to deploy `appOne`, you run build and re-run webgen with the 
 
     cd appOne
     npx run build
-    webgen -port=8090 -deploy appOneSpec.d8m
+    webgen -port=8090 -deploy="/xxx/yyy" appOneSpec.d8m
     d8mc appOneSpecSrvrPort8090.d8m
     mv appOneSpecSrvrPort8090 build/
-The deploy option to webgen bundles a static server into the synthesized server in addition to the code that handles routes arising from transitions. Thus, if the server binary is in the `build` directory it will serve the client code _and_ run the "backend" code. Now you're using a single port, 8090 in this case. 
+The deploy option to webgen bundles a static server into the synthesized server in addition to the code that handles routes arising from transitions. Thus, the server will serve both client code _and_ "backend" code. Now you're using a single port, 8090 in this case. To make this work, the argument to deploy should be a full pathname to the build directory created by running `npm run build`. 
 
 Note that for a webgen app "deploy" means to make it convenient to run on localhost. Deploying an app as a public website is more complicated and is beyond the scope of this document. The deployed app consists of the react-generated contents in `build/` plus the server executable. 
 

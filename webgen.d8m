@@ -655,7 +655,7 @@ import "webgen/boilerplate"
 // Put flags here since portnum is used in following code
 var clientDir:string = flag.String("client", "src", "directory to copy client files to, relative to .")
 var portnum:integer = flag.Int("port", 8080, "port number that server listens to for transitions")
-var deploy:boolean = flag.Bool("deploy", false, "if set, create server only, and include static server for react build/ directory")
+var deploy:string = flag.String("deploy", "", "if non-empty, create server only, and include static server for react build/ directory at pathname given by flag value")
 
 // Here for the App.js codegen:
 // - fixed strings at the top
@@ -782,7 +782,7 @@ val writeAppJS = \mod(wgs: wgState, dir: string, specfile: list(byte)) {
         var errorHook = errhookIndex == nil ? "" : maybeHook(transn.response[errhookIndex])
         var editedResponses = copy(transn.response)
         if(errhookIndex != nil) editedResponses.removeIndex(errhookIndex)
-        val pathpfx = deploy ? "'http://localhost:#{portnum}/_be_/" : "'http://localhost:#{portnum}/"
+        val pathpfx = deploy != "" ? "'http://localhost:#{portnum}/_be_/" : "'http://localhost:#{portnum}/"
         var getpostArgs = pathpfx + dequotify(transn.path) + "/'"
         if(params != "") getpostArgs += (prcl == "get" ? ", {params: {#{params}}}" : ", {#{params}}")
         val updates = bdgpts.[wgs.stateSyms.keyIn(ident)].{ callSetState(ident, ident) }
@@ -895,9 +895,9 @@ val writeServer = \imp(wgs: wgState, specfile: list(byte), fnm:string) {
     // synthesize the runServer ftn that sets up the various HandleFuncs then calls ListenAndServe
     fd.write("val runServer = \\mod(sv:runstateT) {\n")
     if(usesFlag) fd.write("sv.commandLine()\n")
-    if(deploy) {
+    if(deploy != "") {
         // create static server for /; assume server will live in the build/ dir
-        fd.write("val fs = http.FileServer(http.Dir(`.`))\n")
+        fd.write("val fs = http.FileServer(http.Dir(`#{deploy}/build`))\n")
         fd.write("http.Handle(`/`, fs)\n")
     }
     each(trans^wgs.transitions) {
@@ -905,14 +905,14 @@ val writeServer = \imp(wgs: wgState, specfile: list(byte), fnm:string) {
         var stmts: string
         if(tval.isGet) {
             val actuals = tval.requests.{ this.info.ident }
-            val accessCntl = deploy ? "" : "\nw.Header().Add(`Access-Control-Allow-Origin`, `*`)\n"
+            val accessCntl = deploy != "" ? "" : "\nw.Header().Add(`Access-Control-Allow-Origin`, `*`)\n"
             stmts = strings.join(tval.requests.{ this.info.toGetParam }, "\n") + accessCntl +
                 "fmt.Fprint(w, sv.#{tval.actionfn}(#{strings.join(actuals, `, `)}).encode())\n}"
         } else {
             // todo: this dumb code limits POST requests to 5000 bytes. Add ContentLength to defn of import go "net/http" and use it.
             // note that the extra header and the OPTIONS check are there to make CORS work.
             stmts = `w.Header().Add("Content-Type", "application/json"); `
-            unless(deploy) {
+            if(deploy == "") {
                 stmts += `w.Header().Add("Access-Control-Allow-Origin", "*")
                      w.Header().Add("Access-Control-Allow-Headers", "Content-Type")
                      if(r.Method == "OPTIONS") {
@@ -940,7 +940,7 @@ val driver = \imp() {
     flag.Parse()
     val args = flag.Args()
     if(args.count != 1) exit("missing filename argument: expecting 'webgen {-client=path specfile.d8m'")
-    unless(deploy) {
+    if(deploy == "") {
         unless(file.quickCheck(clientDir) == 1) exit("#{clientDir} must be a directory")
         println("target is", clientDir)
     }
@@ -1204,7 +1204,7 @@ val driver = \imp() {
     if(wgs.error != "") { println(wgs.error); return }
 //    each(trns^wgs.transitions) println(trns.key, "=", trns.value)
     //println("************ App.js ************")
-    unless(deploy) {
+    unless(deploy != "") {
         wgs.writeAppJS(clientDir, ps.bytes)
         wgs.writeAppCSS(clientDir, ps.bytes)
         wgs.copyComponents(clientDir)

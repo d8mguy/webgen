@@ -11,6 +11,8 @@ Of course, d8m should be installed first. It should suffice to say
 
     sudo make install
 
+Also, as mentioned in the webgen documentation, webgen runs **pandoc** in certain cases; it's a good idea to install pandoc before trying to use webgen, especially with the distributed examples.
+
 Installing webgen installs an executable named `webgen`. Webgen comes with a set of _standard components_; installation copies these to `~/Library/Application\ Support/D8m/Webgen` and webgen expects to find them there. There are also two d8m modules to help with the server side of webgen specifications: `charthelp` and `md2html`. (Footnote: as distributed, `webgen/modules` includes these two files and two others, which are imported by webgen.d8m. In other words, `webgen/modules` contains both public facing modules for webgen apps, and webgen source code.) You'll be able to import these with the `webgen` prefix, e.g.
 
     import "webgen/charthelp" melted

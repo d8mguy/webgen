@@ -968,7 +968,7 @@ val driver = \imp() {
         if(ps.error != nil) wgs.error = asString(ps.error)
         if(wgs.error != "") break
         val tkn = ps.cxt.tknval
-        val b4 = ps.cxt.ofs - tkn.count
+        var b4 = ps.cxt.ofs - tkn.count
         //println("first token:", tkn)
         if(tkn in parseables) {
             var trm = ps.parseStmt()
@@ -1160,13 +1160,23 @@ val driver = \imp() {
                     wgs.htmls.pushb([htmlfileT: htmlvbl, filespec])
                 }
             }
+        } else if(tkn in ["javascript", "css"]) {
+            ps.nxToken()
+            b4 = ps.cxt.ofs     // move b4 to just after the lbrace
+            unless(ps.cxt.tknval == "{") { wgs.error = "'{' expected"; println(wgs.error); return }
+            val brktinx = always(x~ps.langdef.lexer.brackets.index("{"), x!=nil)/2
+            ps.scanBracket(brktinx)
+            ps.nxToken()
+            val seg = [textsegment: b4, ps.prevtkn.ofs - 1]
+            //println("for #{tkn}, pushing ", cvt(ps.bytes[b4...ps.prevtkn.ofs - 1], string))
+            if(tkn == "javascript") wgs.js.pushb(seg)
+            else if(tkn == "css") wgs.css.pushb(seg)
         } else {
-            if(ps.scanStmt() < 0) ps.nxToken()
+            //if(ps.scanStmt() < 0) ps.nxToken()
+            ps.scanTo(parseables, true)
             val after = ps.prevtkn.ofs
-            var seg = [textsegment: b4, after]
-            if(tkn == "javascript") wgs.js.pushb(bracetrim(seg, ps.bytes))
-            else if(tkn == "css") wgs.css.pushb(bracetrim(seg, ps.bytes))
-            else wgs.d8m.pushb(seg)
+            val seg = [textsegment: b4, after]
+            wgs.d8m.pushb(seg)
             //val strgform = b4 <= after ? cvt(ps.bytes[b4...after], string) : "!!!!!"
             //println("start: #{b4}; end: #{after}", strgform)
         }
